@@ -1,0 +1,3001 @@
+From 1554a69f38e3e090fbe61fba8d388f465ef1a47e Mon Sep 17 00:00:00 2001
+From: Nazir Galimov <nazir.galimov@gmail.com>
+Date: Sun, 15 Feb 2026 22:38:56 +0500
+Subject: [PATCH] feat(image editor): add canvas rotation support
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a rotation field to the SpaceImage struct to store canvas rotation in radians.
+Introduce three new operators: rotate 90° clockwise, rotate 90° counter-clockwise,
+and reset rotation. Add UI menu items in the View menu and default keymaps (comma
+and period keys). Expose the rotation property to RNA for animation and drivers.
+Update the image engine's transformation matrix to apply the visual rotation,
+ensuring pan and zoom work correctly in the rotated view. The rotation is
+normalized to the range [-π, π].
+---
+ .../keyconfig/keymap_data/blender_default.py  |    4 +
+ .../keymap_data/industry_compatible_data.py   |    4 +
+ scripts/startup/bl_ui/space_image.py          |   11 +
+ source/blender/blenkernel/BKE_brush.hh        |   22 +
+ source/blender/blenkernel/intern/brush.cc     |   50 +
+ .../blenloader/intern/versioning_510.cc       |   18 +
+ .../draw/engines/image/image_space_image.hh   |   39 +-
+ .../draw/engines/overlay/overlay_cursor.hh    |    8 +-
+ source/blender/draw/intern/draw_context.cc    |   32 +
+ source/blender/editors/include/ED_image.hh    |   72 ++
+ .../interface/view2d/view2d_gizmo_navigate.cc |   27 +-
+ source/blender/editors/mask/mask_query.cc     |    6 +-
+ .../sculpt_paint/mesh/paint_image_2d.cc       |  242 +++-
+ .../editors/sculpt_paint/paint_cursor.cc      |   25 +-
+ .../editors/sculpt_paint/paint_stroke.cc      |    6 +
+ .../blender/editors/sculpt_paint/sculpt_uv.cc |    8 +-
+ .../editors/space_image/CMakeLists.txt        |   16 +-
+ .../blender/editors/space_image/image_edit.cc |  211 ++++
+ .../editors/space_image/image_intern.hh       |    4 +
+ .../blender/editors/space_image/image_ops.cc  | 1024 ++++++++++++++++-
+ .../editors/space_image/space_image.cc        |    5 +
+ source/blender/editors/transform/transform.cc |   47 +-
+ .../transform/transform_convert_cursor.cc     |    5 +
+ .../editors/transform/transform_generics.cc   |   14 +
+ .../editors/transform/transform_gizmo_2d.cc   |   47 +-
+ source/blender/editors/uvedit/uvedit_ops.cc   |    6 +-
+ source/blender/editors/uvedit/uvedit_path.cc  |    5 +-
+ source/blender/editors/uvedit/uvedit_rip.cc   |    5 +-
+ .../blender/editors/uvedit/uvedit_select.cc   |   91 +-
+ .../editors/uvedit/uvedit_smart_stitch.cc     |    5 +-
+ source/blender/makesdna/DNA_space_types.h     |    9 +-
+ source/blender/makesrna/intern/rna_space.cc   |   13 +
+ 32 files changed, 2002 insertions(+), 79 deletions(-)
+
+diff --git a/scripts/presets/keyconfig/keymap_data/blender_default.py b/scripts/presets/keyconfig/keymap_data/blender_default.py
+index f954da5f650..c699c54d708 100644
+--- a/scripts/presets/keyconfig/keymap_data/blender_default.py
++++ b/scripts/presets/keyconfig/keymap_data/blender_default.py
+@@ -2160,6 +2160,10 @@ def km_image(params):
+         ("image.view_zoom", {"type": 'TRACKPADZOOM', "value": 'ANY'}, None),
+         ("image.view_zoom", {"type": 'TRACKPADPAN', "value": 'ANY', "ctrl": True}, None),
+         ("image.view_zoom_border", {"type": 'B', "value": 'PRESS', "shift": True}, None),
++        ("image.view_rotate_cw", {"type": 'PERIOD', "value": 'PRESS'}, None),
++        ("image.view_rotate_ccw", {"type": 'COMMA', "value": 'PRESS'}, None),
++        ("image.view_rotate_reset", {"type": 'HOME', "value": 'PRESS', "alt": True}, None),
++        ("image.view_rotate_interactive", {"type": 'LEFTMOUSE', "value": 'PRESS', "alt": True}, None),
+         *((
+             "image.view_zoom_ratio",
+             {"type": key, "value": 'PRESS', **mod},
+diff --git a/scripts/presets/keyconfig/keymap_data/industry_compatible_data.py b/scripts/presets/keyconfig/keymap_data/industry_compatible_data.py
+index 31e2c8e54ec..3f3b770bca3 100644
+--- a/scripts/presets/keyconfig/keymap_data/industry_compatible_data.py
++++ b/scripts/presets/keyconfig/keymap_data/industry_compatible_data.py
+@@ -1052,6 +1052,10 @@ def km_image(params):
+         ("image.view_zoom", {"type": 'TRACKPADZOOM', "value": 'ANY'}, None),
+         ("image.view_zoom", {"type": 'TRACKPADPAN', "value": 'ANY', "ctrl": True}, None),
+         ("image.view_zoom_border", {"type": 'Z', "value": 'PRESS'}, None),
++        ("image.view_rotate_cw", {"type": 'PERIOD', "value": 'PRESS'}, None),
++        ("image.view_rotate_ccw", {"type": 'COMMA', "value": 'PRESS'}, None),
++        ("image.view_rotate_reset", {"type": 'HOME', "value": 'PRESS', "alt": True}, None),
++        ("image.view_rotate_interactive", {"type": 'LEFTMOUSE', "value": 'PRESS', "alt": True}, None),
+         ("image.view_zoom_ratio", {"type": 'F1', "value": 'PRESS'},
+          {"properties": [("ratio", 1.0)]}),
+         ("image.view_zoom_ratio", {"type": 'F2', "value": 'PRESS'},
+diff --git a/scripts/startup/bl_ui/space_image.py b/scripts/startup/bl_ui/space_image.py
+index 1e32aff9b7a..eafad808c0e 100644
+--- a/scripts/startup/bl_ui/space_image.py
++++ b/scripts/startup/bl_ui/space_image.py
+@@ -98,6 +98,17 @@ class IMAGE_MT_view(Menu):
+ 
+         layout.separator()
+ 
++        # Canvas Rotation (only in View, Paint, and Mask modes)
++        rotation_supported = sima.mode in {'VIEW', 'PAINT', 'MASK'}
++        layout.label(text="Canvas Rotation", icon='DRIVER_ROTATIONAL_DIFFERENCE')
++        col = layout.column()
++        col.active = rotation_supported
++        col.operator("image.view_rotate_ccw", text="Rotate 90° CCW", icon='LOOP_BACK')
++        col.operator("image.view_rotate_cw", text="Rotate 90° CW", icon='LOOP_FORWARDS')
++        col.operator("image.view_rotate_reset", text="Reset Rotation", icon='FILE_REFRESH')
++
++        layout.separator()
++
+         if show_render:
+             layout.operator("image.render_border")
+             layout.operator("image.clear_render_border")
+diff --git a/source/blender/blenkernel/BKE_brush.hh b/source/blender/blenkernel/BKE_brush.hh
+index 644e5a4f949..8365e64a06f 100644
+--- a/source/blender/blenkernel/BKE_brush.hh
++++ b/source/blender/blenkernel/BKE_brush.hh
+@@ -144,8 +144,30 @@ float BKE_brush_sample_tex_3d(const Paint *paint,
+                               float4 &rgba,
+                               int thread,
+                               ImagePool *pool);
++/**
++ * Version with additional rotation offset for canvas rotation compensation.
++ * The rotation_offset is added to the brush rotation for texture sampling.
++ */
++float BKE_brush_sample_tex_3d(const Paint *paint,
++                              const Brush *br,
++                              const MTex *mtex,
++                              const float3 &point,
++                              float4 &rgba,
++                              int thread,
++                              ImagePool *pool,
++                              float rotation_offset);
+ float BKE_brush_sample_masktex(
+     const Paint *paint, Brush *br, const float2 &point, int thread, ImagePool *pool);
++/**
++ * Version with additional rotation offset for canvas rotation compensation.
++ * The rotation_offset is added to the brush rotation for mask sampling.
++ */
++float BKE_brush_sample_masktex(const Paint *paint,
++                               Brush *br,
++                               const float2 &point,
++                               int thread,
++                               ImagePool *pool,
++                               float rotation_offset);
+ 
+ /**
+  * Get the mask texture for this given object mode.
+diff --git a/source/blender/blenkernel/intern/brush.cc b/source/blender/blenkernel/intern/brush.cc
+index 6b9aa316d5c..620f66aac07 100644
+--- a/source/blender/blenkernel/intern/brush.cc
++++ b/source/blender/blenkernel/intern/brush.cc
+@@ -1025,6 +1025,33 @@ float BKE_brush_sample_tex_3d(const Paint *paint,
+   return intensity;
+ }
+ 
++/**
++ * Overloaded version with rotation offset for canvas rotation compensation.
++ * This allows passing canvas rotation without modifying global paint_runtime state.
++ */
++float BKE_brush_sample_tex_3d(const Paint *paint,
++                              const Brush *br,
++                              const MTex *mtex,
++                              const float3 &point,
++                              float4 &rgba,
++                              int thread,
++                              ImagePool *pool,
++                              float rotation_offset)
++{
++  /* Temporarily modify brush_rotation to account for canvas rotation.
++   * This is safe because we restore the original value before returning.
++   * The rotation_offset is subtracted because that's how brush_rotation is used
++   * in the texture sampling code. */
++  bke::PaintRuntime *runtime = const_cast<bke::PaintRuntime *>(paint->runtime);
++  const float original_rotation = runtime->brush_rotation;
++  runtime->brush_rotation -= rotation_offset;
++
++  float result = BKE_brush_sample_tex_3d(paint, br, mtex, point, rgba, thread, pool);
++
++  runtime->brush_rotation = original_rotation;
++  return result;
++}
++
+ float BKE_brush_sample_masktex(
+     const Paint *paint, Brush *br, const float2 &point, const int thread, ImagePool *pool)
+ {
+@@ -1140,6 +1167,29 @@ float BKE_brush_sample_masktex(
+   return intensity;
+ }
+ 
++/**
++ * Overloaded version with rotation offset for canvas rotation compensation.
++ * This allows passing canvas rotation without modifying global paint_runtime state.
++ */
++float BKE_brush_sample_masktex(const Paint *paint,
++                               Brush *br,
++                               const float2 &point,
++                               int thread,
++                               ImagePool *pool,
++                               float rotation_offset)
++{
++  /* Temporarily modify brush_rotation_sec to account for canvas rotation.
++   * This is safe because we restore the original value before returning. */
++  bke::PaintRuntime *runtime = const_cast<bke::PaintRuntime *>(paint->runtime);
++  const float original_rotation = runtime->brush_rotation_sec;
++  runtime->brush_rotation_sec -= rotation_offset;
++
++  float result = BKE_brush_sample_masktex(paint, br, point, thread, pool);
++
++  runtime->brush_rotation_sec = original_rotation;
++  return result;
++}
++
+ /* -------------------------------------------------------------------- */
+ /** \name Unified Settings
+  * \{ */
+diff --git a/source/blender/blenloader/intern/versioning_510.cc b/source/blender/blenloader/intern/versioning_510.cc
+index c197bf08bd9..649fdf3264e 100644
+--- a/source/blender/blenloader/intern/versioning_510.cc
++++ b/source/blender/blenloader/intern/versioning_510.cc
+@@ -18,9 +18,12 @@
+ #include "DNA_node_types.h"
+ #include "DNA_screen_types.h"
+ #include "DNA_sequence_types.h"
++#include "DNA_space_types.h"
+ #include "DNA_windowmanager_types.h"
+ #include "DNA_workspace_types.h"
+ 
++#include <cmath>
++
+ #include "BLI_listbase.h"
+ #include "BLI_math_vector.h"
+ #include "BLI_string.h"
+@@ -673,6 +676,21 @@ void do_versions_after_linking_510(FileData *fd, Main *bmain)
+     }
+   }
+ 
++  if (!MAIN_VERSION_FILE_ATLEAST(bmain, 502, 4)) {
++    /* Initialize cached sin/cos values for SpaceImage rotation. */
++    for (bScreen &screen : bmain->screens) {
++      for (ScrArea &area : screen.areabase) {
++        for (SpaceLink &space : area.spacedata) {
++          if (space.spacetype == SPACE_IMAGE) {
++            SpaceImage *sima = reinterpret_cast<SpaceImage *>(&space);
++            sima->rotation_sin = std::sin(sima->rotation);
++            sima->rotation_cos = std::cos(sima->rotation);
++          }
++        }
++      }
++    }
++  }
++
+   /**
+    * Always bump subversion in BKE_blender_version.h when adding versioning
+    * code here, and wrap it inside a MAIN_VERSION_FILE_ATLEAST check.
+diff --git a/source/blender/draw/engines/image/image_space_image.hh b/source/blender/draw/engines/image/image_space_image.hh
+index 6d93b649407..186658d525c 100644
+--- a/source/blender/draw/engines/image/image_space_image.hh
++++ b/source/blender/draw/engines/image/image_space_image.hh
+@@ -12,6 +12,9 @@
+ 
+ #include "DNA_screen_types.h"
+ 
++#include "BLI_math_base.h"
++#include "BLI_math_matrix.h"
++
+ #include "image_private.hh"
+ #include "image_shader_shared.hh"
+ 
+@@ -111,10 +114,38 @@ class SpaceImageAccessor : public AbstractSpaceAccessor {
+     float translate_x = scale_x * -region->v2d.cur.xmin + display_offset_x;
+     float translate_y = scale_y * -region->v2d.cur.ymin + display_offset_y;
+ 
+-    r_uv_to_texture[0][0] = scale_x;
+-    r_uv_to_texture[1][1] = scale_y;
+-    r_uv_to_texture[3][0] = translate_x;
+-    r_uv_to_texture[3][1] = translate_y;
++    /* Check if rotation is supported in current mode */
++    if (sima->rotation != 0.0f && ED_space_image_rotation_supported(sima)) {
++      const float cos_r = cosf(sima->rotation);
++      const float sin_r = sinf(sima->rotation);
++      const float winx = float(region->winx);
++      const float winy = float(region->winy);
++      const float aspect_x = winx / winy;
++      const float aspect_y = winy / winx;
++
++      const float pivot_x = sima->rotation_pivot[0];
++      const float pivot_y = sima->rotation_pivot[1];
++
++      const float pivot_ss_x = scale_x * pivot_x;
++      const float pivot_ss_y = scale_y * pivot_y;
++
++      const float pivot_ss_rot_x = cos_r * pivot_ss_x - (aspect_y * sin_r) * pivot_ss_y;
++      const float pivot_ss_rot_y = (aspect_x * sin_r) * pivot_ss_x + cos_r * pivot_ss_y;
++
++      r_uv_to_texture[0][0] = cos_r * scale_x;
++      r_uv_to_texture[0][1] = (aspect_x * sin_r) * scale_x;
++      r_uv_to_texture[1][0] = -(aspect_y * sin_r) * scale_y;
++      r_uv_to_texture[1][1] = cos_r * scale_y;
++
++      r_uv_to_texture[3][0] = translate_x + pivot_ss_x - pivot_ss_rot_x;
++      r_uv_to_texture[3][1] = translate_y + pivot_ss_y - pivot_ss_rot_y;
++    }
++    else {
++      r_uv_to_texture[0][0] = scale_x;
++      r_uv_to_texture[1][1] = scale_y;
++      r_uv_to_texture[3][0] = translate_x;
++      r_uv_to_texture[3][1] = translate_y;
++    }
+   }
+ };
+ 
+diff --git a/source/blender/draw/engines/overlay/overlay_cursor.hh b/source/blender/draw/engines/overlay/overlay_cursor.hh
+index 426557dd065..14ac7a85c37 100644
+--- a/source/blender/draw/engines/overlay/overlay_cursor.hh
++++ b/source/blender/draw/engines/overlay/overlay_cursor.hh
+@@ -14,6 +14,7 @@
+ #include "DNA_screen_types.h"
+ #include "DNA_space_types.h"
+ 
++#include "ED_image.hh"
+ #include "ED_view3d.hh"
+ #include "UI_view2d.hh"
+ 
+@@ -68,8 +69,11 @@ class Cursor : Overlay {
+     }
+     else {
+       const SpaceImage *sima = reinterpret_cast<const SpaceImage *>(state.space_data);
+-      ui::view2d_view_to_region(
+-          &state.region->v2d, sima->cursor[0], sima->cursor[1], &pixel_coord[0], &pixel_coord[1]);
++      /* Use rotation-compensated projection for 2D cursor in Image Editor. */
++      float cursor_screen[2];
++      ED_image_view_to_region_rotated(sima, state.region, sima->cursor, cursor_screen);
++      pixel_coord[0] = cursor_screen[0];
++      pixel_coord[1] = cursor_screen[1];
+     }
+ 
+     float4x4 cursor_mat = math::from_scale<float4x4>(float2(U.widget_unit));
+diff --git a/source/blender/draw/intern/draw_context.cc b/source/blender/draw/intern/draw_context.cc
+index 31a04c125e7..0cffae97b91 100644
+--- a/source/blender/draw/intern/draw_context.cc
++++ b/source/blender/draw/intern/draw_context.cc
+@@ -16,6 +16,7 @@
+ #include "BLI_map.hh"
+ #include "BLI_math_matrix.h"
+ #include "BLI_math_matrix_types.hh"
++#include "BLI_math_rotation.h"
+ #include "BLI_math_vector.h"
+ #include "BLI_rect.h"
+ #include "BLI_string.h"
+@@ -470,6 +471,37 @@ void DRWContext::acquire_data()
+       float4x4 viewmat;
+       BLI_rctf_transform_calc_m4_pivot_min(&v2d->cur, &region_space, viewmat.ptr());
+ 
++      if (this->space_data && this->space_data->spacetype == SPACE_IMAGE) {
++        SpaceImage *sima = reinterpret_cast<SpaceImage *>(this->space_data);
++        if (sima->rotation != 0.0f) {
++          float rotmat[4][4], t1[4][4], r[4][4], t2[4][4], tmp[4][4];
++          float pivot[3] = {sima->rotation_pivot[0], sima->rotation_pivot[1], 0.0f};
++
++          /* Create transform: Translate(Pivot) * Rotate(Angle) * Translate(-Pivot) */
++
++          /* 1. Translate to origin */
++          unit_m4(t1);
++          translate_m4(t1, -pivot[0], -pivot[1], 0.0f);
++
++          /* 2. Rotate */
++          unit_m4(r);
++          rotate_m4(r, 'Z', sima->rotation);
++
++          /* 3. Translate back */
++          unit_m4(t2);
++          translate_m4(t2, pivot[0], pivot[1], 0.0f);
++
++          /* Combine: T2 * R * T1 */
++          mul_m4_m4m4(tmp, r, t1);
++          mul_m4_m4m4(rotmat, t2, tmp);
++
++          /* Apply to viewmat: ViewMat = ViewMat * RotMat */
++          float viewmat_copy[4][4];
++          copy_m4_m4(viewmat_copy, (float (*)[4])viewmat.ptr());
++          mul_m4_m4m4((float (*)[4])viewmat.ptr(), viewmat_copy, rotmat);
++        }
++      }
++
+       float4x4 winmat = float4x4::identity();
+       winmat[0][0] = winmat[1][1] = 2.0f;
+       winmat[3][0] = winmat[3][1] = -1.0f;
+diff --git a/source/blender/editors/include/ED_image.hh b/source/blender/editors/include/ED_image.hh
+index e224a0b7572..2e2cd0da8d7 100644
+--- a/source/blender/editors/include/ED_image.hh
++++ b/source/blender/editors/include/ED_image.hh
+@@ -112,6 +112,78 @@ void ED_image_point_pos__reverse(SpaceImage *sima,
+                                  const ARegion *region,
+                                  const float co[2],
+                                  float r_co[2]);
++
++/* Const versions of coordinate conversion functions for use in rotation wrappers. */
++void ED_image_mouse_pos_const(const SpaceImage *sima,
++                              const ARegion *region,
++                              const int mval[2],
++                              float co[2]);
++void ED_image_point_pos_const(
++    const SpaceImage *sima, const ARegion *region, float x, float y, float *r_x, float *r_y);
++void ED_image_point_pos__reverse_const(const SpaceImage *sima,
++                                       const ARegion *region,
++                                       const float co[2],
++                                       float r_co[2]);
++
++/**
++ * Mouse position in image space, compensated for canvas rotation.
++ * Use this instead of ED_image_mouse_pos() when the canvas may be rotated
++ * and you need coordinates that map correctly to the actual image/UV data.
++ *
++ * \param sima: SpaceImage containing the rotation value.
++ * \param region: Region for coordinate conversion.
++ * \param mval: Mouse position in region coordinates (event->mval).
++ * \param r_co: Result in UV/image coordinates (0..1 range), rotation-compensated.
++ */
++void ED_image_mouse_pos_rotated(const SpaceImage *sima,
++                                const ARegion *region,
++                                const int mval[2],
++                                float r_co[2]);
++
++/**
++ * Convert UV/image coordinates to screen coordinates, compensated for canvas rotation.
++ * This is the inverse of ED_image_mouse_pos_rotated().
++ *
++ * \param sima: SpaceImage containing the rotation value.
++ * \param region: Region for coordinate conversion.
++ * \param co: UV/image coordinates (0..1 range).
++ * \param r_co: Result in screen/region coordinates.
++ */
++void ED_image_view_to_region_rotated(const SpaceImage *sima,
++                                     const ARegion *region,
++                                     const float co[2],
++                                     float r_co[2]);
++
++/**
++ * Point position in image space (float version), compensated for canvas rotation.
++ * Same as ED_image_point_pos() but with rotation compensation.
++ */
++void ED_image_point_pos_rotated(
++    SpaceImage *sima, const ARegion *region, float x, float y, float *r_x, float *r_y);
++
++/**
++ * Convert UV/image coordinates to screen coordinates (float version), compensated for rotation.
++ * Same as ED_image_point_pos__reverse() but with rotation compensation.
++ */
++void ED_image_point_pos__reverse_rotated(SpaceImage *sima,
++                                         const ARegion *region,
++                                         const float co[2],
++                                         float r_co[2]);
++
++/**
++ * Update cached sin/cos values for canvas rotation.
++ * Must be called whenever sima->rotation is changed.
++ * This avoids repeated sin/cos calculations in coordinate conversion functions.
++ */
++void ED_space_image_rotation_cache_update(SpaceImage *sima);
++
++/**
++ * Check if canvas rotation is supported in the current mode.
++ * Rotation is supported in View, Paint, and Mask modes.
++ * Rotation is NOT supported in UV Editor mode.
++ */
++bool ED_space_image_rotation_supported(const SpaceImage *sima);
++
+ /**
+  * This is more a user-level functionality, for going to `next/prev` used slot,
+  * Stepping onto the last unused slot too.
+diff --git a/source/blender/editors/interface/view2d/view2d_gizmo_navigate.cc b/source/blender/editors/interface/view2d/view2d_gizmo_navigate.cc
+index d3f63904a69..482221bec4d 100644
+--- a/source/blender/editors/interface/view2d/view2d_gizmo_navigate.cc
++++ b/source/blender/editors/interface/view2d/view2d_gizmo_navigate.cc
+@@ -46,8 +46,9 @@ namespace {
+ enum {
+   GZ_INDEX_MOVE = 0,
+   GZ_INDEX_ZOOM = 1,
++  GZ_INDEX_ROTATE = 2,
+ 
+-  GZ_INDEX_TOTAL = 2,
++  GZ_INDEX_TOTAL = 3,
+ };
+ 
+ struct NavigateGizmoInfo {
+@@ -77,6 +78,11 @@ static NavigateGizmoInfo g_navigate_params_for_space_image[GZ_INDEX_TOTAL] = {
+         "GIZMO_GT_button_2d",
+         ICON_VIEW_ZOOM,
+     },
++    {
++        "IMAGE_OT_view_rotate_interactive",
++        "GIZMO_GT_button_2d",
++        ICON_GESTURE_ROTATE,
++    },
+ };
+ 
+ static NavigateGizmoInfo g_navigate_params_for_space_clip[GZ_INDEX_TOTAL] = {
+@@ -164,7 +170,8 @@ static void WIDGETGROUP_navigate_setup(const bContext * /*C*/, wmGizmoGroup *gzg
+     const NavigateGizmoInfo *info = &navigate_params[i];
+     navgroup->gz_array[i] = WM_gizmo_new(info->gizmo, gzgroup, nullptr);
+     wmGizmo *gz = navgroup->gz_array[i];
+-    gz->flag |= WM_GIZMO_MOVE_CURSOR | WM_GIZMO_DRAW_MODAL;
++    gz->flag |= WM_GIZMO_MOVE_CURSOR;
++    /* Don't set WM_GIZMO_DRAW_MODAL - gizmos should only draw on hover. */
+ 
+     {
+       uchar icon_color[3];
+@@ -214,6 +221,13 @@ static void WIDGETGROUP_navigate_setup(const bContext * /*C*/, wmGizmoGroup *gzg
+     }
+   }
+ 
++  /* Set use_center_pivot=true for rotate operator when called from gizmo. */
++  if (navigate_params == g_navigate_params_for_space_image) {
++    wmGizmo *gz = navgroup->gz_array[GZ_INDEX_ROTATE];
++    wmGizmoOpElem *gzop = WM_gizmo_operator_get(gz, 0);
++    RNA_boolean_set(&gzop->ptr, "use_center_pivot", true);
++  }
++
+   gzgroup->customdata = navgroup;
+ }
+ 
+@@ -257,6 +271,15 @@ static void WIDGETGROUP_navigate_draw_prepare(const bContext *C, wmGizmoGroup *g
+   gz->matrix_basis[3][0] = roundf(co[0]);
+   gz->matrix_basis[3][1] = roundf(co[1] - (icon_offset_mini * icon_mini_slot++));
+   WM_gizmo_set_flag(gz, WM_GIZMO_HIDDEN, false);
++
++  const NavigateGizmoInfo *navigate_params = navigate_params_from_space_type(
++      gzgroup->type->gzmap_params.spaceid);
++  if (navigate_params == g_navigate_params_for_space_image) {
++    gz = navgroup->gz_array[GZ_INDEX_ROTATE];
++    gz->matrix_basis[3][0] = roundf(co[0]);
++    gz->matrix_basis[3][1] = roundf(co[1] - (icon_offset_mini * icon_mini_slot++));
++    WM_gizmo_set_flag(gz, WM_GIZMO_HIDDEN, false);
++  }
+ }
+ 
+ void VIEW2D_GGT_navigate_impl(wmGizmoGroupType *gzgt, const char *idname)
+diff --git a/source/blender/editors/mask/mask_query.cc b/source/blender/editors/mask/mask_query.cc
+index 1b1d02201cb..0e51405400d 100644
+--- a/source/blender/editors/mask/mask_query.cc
++++ b/source/blender/editors/mask/mask_query.cc
+@@ -501,7 +501,7 @@ void ED_mask_mouse_pos(ScrArea *area, ARegion *region, const int mval[2], float
+       }
+       case SPACE_IMAGE: {
+         SpaceImage *sima = static_cast<SpaceImage *>(area->spacedata.first);
+-        ED_image_mouse_pos(sima, region, mval, r_co);
++        ED_image_mouse_pos_rotated(sima, region, mval, r_co);
+         BKE_mask_coord_from_image(sima->image, &sima->iuser, r_co, r_co);
+         break;
+       }
+@@ -535,7 +535,7 @@ void ED_mask_point_pos(ScrArea *area, ARegion *region, float x, float y, float *
+         break;
+       case SPACE_IMAGE: {
+         SpaceImage *sima = static_cast<SpaceImage *>(area->spacedata.first);
+-        ED_image_point_pos(sima, region, x, y, &co[0], &co[1]);
++        ED_image_point_pos_rotated(sima, region, x, y, &co[0], &co[1]);
+         BKE_mask_coord_from_image(sima->image, &sima->iuser, co, co);
+         break;
+       }
+@@ -578,7 +578,7 @@ void ED_mask_point_pos__reverse(
+         co[0] = x;
+         co[1] = y;
+         BKE_mask_coord_to_image(sima->image, &sima->iuser, co, co);
+-        ED_image_point_pos__reverse(sima, region, co, co);
++        ED_image_point_pos__reverse_rotated(sima, region, co, co);
+         break;
+       }
+       default:
+diff --git a/source/blender/editors/sculpt_paint/mesh/paint_image_2d.cc b/source/blender/editors/sculpt_paint/mesh/paint_image_2d.cc
+index b06c698d19b..3093a603b23 100644
+--- a/source/blender/editors/sculpt_paint/mesh/paint_image_2d.cc
++++ b/source/blender/editors/sculpt_paint/mesh/paint_image_2d.cc
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <algorithm>
++#include <cstdio>
+ #include <cstring>
+ 
+ #include "MEM_guardedalloc.h"
+@@ -17,6 +18,7 @@
+ 
+ #include "BLI_bitmap.h"
+ #include "BLI_listbase.h"
++#include "BLI_math_base.h"
+ #include "BLI_math_color.h"
+ #include "BLI_math_color_blend.h"
+ #include "BLI_stack.h"
+@@ -32,6 +34,7 @@
+ 
+ #include "DEG_depsgraph.hh"
+ 
++#include "ED_image.hh"
+ #include "ED_paint.hh"
+ #include "ED_screen.hh"
+ 
+@@ -48,6 +51,57 @@
+ 
+ namespace blender {
+ 
++/**
++ * RAII helper class for temporarily modifying brush rotation values in PaintRuntime.
++ * This provides a safe, exception-safe way to apply canvas rotation compensation
++ * during texture sampling without risking leaving the runtime in an inconsistent state.
++ *
++ * Note: Uses const_cast internally because Paint::runtime is const, but the runtime
++ * data is mutable and designed to be modified during painting operations.
++ */
++class ScopedBrushRotationOverride {
++ public:
++  ScopedBrushRotationOverride(const Paint *paint,
++                              float tex_rotation_offset,
++                              float mask_rotation_offset,
++                              bool apply_tex,
++                              bool apply_mask)
++      : runtime_(const_cast<bke::PaintRuntime *>(paint->runtime)),
++        apply_tex_(apply_tex),
++        apply_mask_(apply_mask),
++        original_brush_rotation_(runtime_->brush_rotation),
++        original_brush_rotation_sec_(runtime_->brush_rotation_sec)
++  {
++    if (apply_tex_) {
++      runtime_->brush_rotation -= tex_rotation_offset;
++    }
++    if (apply_mask_) {
++      runtime_->brush_rotation_sec -= mask_rotation_offset;
++    }
++  }
++
++  ~ScopedBrushRotationOverride()
++  {
++    if (apply_tex_) {
++      runtime_->brush_rotation = original_brush_rotation_;
++    }
++    if (apply_mask_) {
++      runtime_->brush_rotation_sec = original_brush_rotation_sec_;
++    }
++  }
++
++  /* Prevent copying */
++  ScopedBrushRotationOverride(const ScopedBrushRotationOverride &) = delete;
++  ScopedBrushRotationOverride &operator=(const ScopedBrushRotationOverride &) = delete;
++
++ private:
++  bke::PaintRuntime *runtime_;
++  bool apply_tex_;
++  bool apply_mask_;
++  float original_brush_rotation_;
++  float original_brush_rotation_sec_;
++};
++
+ /* Brush Painting for 2D image editor */
+ 
+ /* Defines and Structs */
+@@ -740,15 +794,49 @@ static void brush_painter_2d_refresh_cache(ImagePaintState *s,
+                              BRUSH_GRADIENT_SPACING_CLAMP) ||
+                         (cache->last_pressure != pressure))) ||
+                       BKE_brush_color_jitter_get_settings(painter->paint, brush);
+-  float tex_rotation = -brush->mtex.rot;
+-  float mask_rotation = -brush->mask_mtex.rot;
++  float tex_rotation = brush->mtex.rot;
++  float mask_rotation = brush->mask_mtex.rot;
++
++  float canvas_rotation = (s->sima) ? s->sima->rotation : 0.0f;
+ 
+   painter->pool = BKE_image_pool_new();
+ 
++  /* Calculate rotation offsets for canvas rotation compensation.
++   * Only apply to VIEW and RANDOM mapping modes. */
++  float tex_rotation_offset = 0.0f;
++  float mask_rotation_offset = 0.0f;
++  bool apply_tex_rotation = false;
++  bool apply_mask_rotation = false;
++
++  if (canvas_rotation != 0.0f) {
++    if (cache->is_texbrush &&
++        ELEM(brush->mtex.brush_map_mode, MTEX_MAP_MODE_VIEW, MTEX_MAP_MODE_RANDOM))
++    {
++      tex_rotation_offset = canvas_rotation;
++      apply_tex_rotation = true;
++    }
++    if (cache->is_maskbrush &&
++        ELEM(brush->mask_mtex.brush_map_mode, MTEX_MAP_MODE_VIEW, MTEX_MAP_MODE_RANDOM))
++    {
++      mask_rotation_offset = canvas_rotation;
++      apply_mask_rotation = true;
++    }
++  }
++
++  /* Calculate effective rotation for cache invalidation decisions */
++  float brush_rotation_for_sampling = paint_runtime->brush_rotation;
++  float brush_rotation_sec_for_sampling = paint_runtime->brush_rotation_sec;
++  if (apply_tex_rotation) {
++    brush_rotation_for_sampling -= canvas_rotation;
++  }
++  if (apply_mask_rotation) {
++    brush_rotation_sec_for_sampling -= canvas_rotation;
++  }
++
+   /* determine how can update based on textures used */
+   if (cache->is_texbrush) {
+     if (brush->mtex.brush_map_mode == MTEX_MAP_MODE_VIEW) {
+-      tex_rotation += paint_runtime->brush_rotation;
++      tex_rotation += brush_rotation_for_sampling;
+     }
+     else if (brush->mtex.brush_map_mode == MTEX_MAP_MODE_RANDOM) {
+       do_random = true;
+@@ -766,7 +854,7 @@ static void brush_painter_2d_refresh_cache(ImagePaintState *s,
+     bool do_partial_update_mask = false;
+     /* invalidate case for all mapping modes */
+     if (brush->mask_mtex.brush_map_mode == MTEX_MAP_MODE_VIEW) {
+-      mask_rotation += paint_runtime->brush_rotation_sec;
++      mask_rotation += brush_rotation_sec_for_sampling;
+     }
+     else if (brush->mask_mtex.brush_map_mode == MTEX_MAP_MODE_RANDOM) {
+       renew_maxmask = true;
+@@ -789,11 +877,20 @@ static void brush_painter_2d_refresh_cache(ImagePaintState *s,
+       brush_painter_2d_tex_mapping(
+           s, tile, diameter, pos, mouse, brush->mask_mtex.brush_map_mode, &painter->mask_mapping);
+ 
+-      if (do_partial_update_mask) {
+-        brush_painter_mask_imbuf_partial_update(painter, tile, pos, diameter);
+-      }
+-      else {
+-        cache->tex_mask = brush_painter_mask_ibuf_new(painter, diameter);
++      /* Use RAII scope for safe rotation override */
++      {
++        ScopedBrushRotationOverride rotation_override(painter->paint,
++                                                      tex_rotation_offset,
++                                                      mask_rotation_offset,
++                                                      apply_tex_rotation,
++                                                      apply_mask_rotation);
++
++        if (do_partial_update_mask) {
++          brush_painter_mask_imbuf_partial_update(painter, tile, pos, diameter);
++        }
++        else {
++          cache->tex_mask = brush_painter_mask_ibuf_new(painter, diameter);
++        }
+       }
+       cache->last_mask_rotation = mask_rotation;
+     }
+@@ -802,6 +899,39 @@ static void brush_painter_2d_refresh_cache(ImagePaintState *s,
+   /* Re-initialize the curve mask. Mask is always recreated due to the change of position. */
+   paint_curve_mask_cache_update(&cache->curve_mask_cache, brush, diameter, size, pos);
+ 
++  {
++    static bool did_print = false;
++    static float last_mtex_rot = 0.0f;
++    static float last_mask_rot = 0.0f;
++    static float last_brush_rot = 0.0f;
++    static float last_brush_rot_sec = 0.0f;
++    static float last_canvas_rot = 0.0f;
++    if (!did_print || last_mtex_rot != brush->mtex.rot || last_mask_rot != brush->mask_mtex.rot ||
++        last_brush_rot != brush_rotation_for_sampling ||
++        last_brush_rot_sec != brush_rotation_sec_for_sampling ||
++        last_canvas_rot != canvas_rotation)
++    {
++      did_print = true;
++      last_mtex_rot = brush->mtex.rot;
++      last_mask_rot = brush->mask_mtex.rot;
++      last_brush_rot = brush_rotation_for_sampling;
++      last_brush_rot_sec = brush_rotation_sec_for_sampling;
++      last_canvas_rot = canvas_rotation;
++      printf(
++          "\n=== [BrushTex Stroke] map=%d mask_map=%d mtex=%.2f mask=%.2f brush=%.2f brush2=%.2f "
++          "canvas=%.2f tex_final=%.2f mask_final=%.2f (deg) ===\n",
++          int(brush->mtex.brush_map_mode),
++          int(brush->mask_mtex.brush_map_mode),
++          brush->mtex.rot * 180.0f / M_PI,
++          brush->mask_mtex.rot * 180.0f / M_PI,
++          brush_rotation_for_sampling * 180.0f / M_PI,
++          brush_rotation_sec_for_sampling * 180.0f / M_PI,
++          canvas_rotation * 180.0f / M_PI,
++          tex_rotation * 180.0f / M_PI,
++          mask_rotation * 180.0f / M_PI);
++    }
++  }
++
+   /* detect if we need to recreate image brush buffer */
+   if (diameter != cache->lastdiameter || (tex_rotation != cache->last_tex_rotation) || do_random ||
+       update_color)
+@@ -811,13 +941,22 @@ static void brush_painter_2d_refresh_cache(ImagePaintState *s,
+       cache->ibuf = nullptr;
+     }
+ 
+-    if (do_partial_update) {
+-      /* do partial update of texture */
+-      brush_painter_imbuf_partial_update(painter, tile, pos, diameter);
+-    }
+-    else {
+-      /* create brush from scratch */
+-      cache->ibuf = brush_painter_imbuf_new(painter, tile, diameter, pressure, distance);
++    /* Use RAII scope for safe rotation override */
++    {
++      ScopedBrushRotationOverride rotation_override(painter->paint,
++                                                    tex_rotation_offset,
++                                                    mask_rotation_offset,
++                                                    apply_tex_rotation,
++                                                    apply_mask_rotation);
++
++      if (do_partial_update) {
++        /* do partial update of texture */
++        brush_painter_imbuf_partial_update(painter, tile, pos, diameter);
++      }
++      else {
++        /* create brush from scratch */
++        cache->ibuf = brush_painter_imbuf_new(painter, tile, diameter, pressure, distance);
++      }
+     }
+ 
+     cache->lastdiameter = diameter;
+@@ -830,6 +969,12 @@ static void brush_painter_2d_refresh_cache(ImagePaintState *s,
+     int dy = int(floorf(tile->last_paintpos[1])) - int(floorf(pos[1]));
+ 
+     if ((dx != 0) || (dy != 0)) {
++      /* Use RAII scope for safe rotation override */
++      ScopedBrushRotationOverride rotation_override(painter->paint,
++                                                    tex_rotation_offset,
++                                                    mask_rotation_offset,
++                                                    apply_tex_rotation,
++                                                    apply_mask_rotation);
+       brush_painter_imbuf_partial_update(painter, tile, pos, diameter);
+     }
+   }
+@@ -1489,11 +1634,47 @@ static void paint_2d_canvas_free(ImagePaintState *s)
+   }
+ }
+ 
++/**
++ * Apply inverse rotation to UV coordinates to compensate for canvas rotation.
++ * This makes tools work correctly when the canvas is visually rotated.
++ * \param pivot: The pivot point in UV space (typically sima->rotation_pivot).
++ * \param rotation_cos: Pre-cached cos(rotation).
++ * \param rotation_sin: Pre-cached sin(rotation).
++ */
++static void paint_2d_apply_rotation_inverse(float uv[2],
++                                            float rotation_cos,
++                                            float rotation_sin,
++                                            const float pivot[2])
++{
++  if (rotation_sin != 0.0f) {
++    float dx = uv[0] - pivot[0];
++    float dy = uv[1] - pivot[1];
++
++    /* For inverse rotation: cos(-θ) = cos(θ), sin(-θ) = -sin(θ) */
++    float cos_r = rotation_cos;
++    float sin_r = -rotation_sin;
++
++    uv[0] = pivot[0] + dx * cos_r - dy * sin_r;
++    uv[1] = pivot[1] + dx * sin_r + dy * cos_r;
++  }
++}
++
+ static void paint_2d_transform_mouse(View2D *v2d, const float in[2], float out[2])
+ {
+   ui::view2d_region_to_view(v2d, in[0], in[1], &out[0], &out[1]);
+ }
+ 
++static void paint_2d_transform_mouse_rotated(View2D *v2d,
++                                             const float in[2],
++                                             float out[2],
++                                             float rotation_cos,
++                                             float rotation_sin,
++                                             const float pivot[2])
++{
++  ui::view2d_region_to_view(v2d, in[0], in[1], &out[0], &out[1]);
++  paint_2d_apply_rotation_inverse(out, rotation_cos, rotation_sin, pivot);
++}
++
+ static bool is_inside_tile(const int size[2], const float pos[2], const float brush[2])
+ {
+   return (pos[0] >= -brush[0]) && (pos[0] < size[0] + brush[0]) && (pos[1] >= -brush[1]) &&
+@@ -1523,11 +1704,22 @@ void paint_2d_stroke(void *ps,
+     s->blend = IMB_BLEND_ERASE_ALPHA;
+   }
+ 
+-  ui::view2d_region_to_view(s->v2d, mval[0], mval[1], &new_uv[0], &new_uv[1]);
+-  ui::view2d_region_to_view(s->v2d, prev_mval[0], prev_mval[1], &old_uv[0], &old_uv[1]);
++  /* Get rotation from SpaceImage for coordinate compensation */
++  float rotation_cos = (s->sima) ? s->sima->rotation_cos : 1.0f;
++  float rotation_sin = (s->sima) ? s->sima->rotation_sin : 0.0f;
++  float pivot[2] = {0.5f, 0.5f};
++  if (s->sima) {
++    pivot[0] = s->sima->rotation_pivot[0];
++    pivot[1] = s->sima->rotation_pivot[1];
++  }
++
++  /* Transform mouse to UV coordinates with rotation compensation */
++  paint_2d_transform_mouse_rotated(s->v2d, mval, new_uv, rotation_cos, rotation_sin, pivot);
++  paint_2d_transform_mouse_rotated(s->v2d, prev_mval, old_uv, rotation_cos, rotation_sin, pivot);
+ 
+   float last_uv[2], start_uv[2];
+   ui::view2d_region_to_view(s->v2d, 0.0f, 0.0f, &start_uv[0], &start_uv[1]);
++  paint_2d_apply_rotation_inverse(start_uv, rotation_cos, rotation_sin, pivot);
+   if (painter->firsttouch) {
+     /* paint exactly once on first touch */
+     copy_v2_v2(last_uv, new_uv);
+@@ -1861,9 +2053,12 @@ void paint_2d_bucket_fill(const bContext *C,
+   }
+ 
+   View2D *v2d = s ? s->v2d : &CTX_wm_region(C)->v2d;
++  float rotation_cos = sima->rotation_cos;
++  float rotation_sin = sima->rotation_sin;
++  float pivot[2] = {sima->rotation_pivot[0], sima->rotation_pivot[1]};
+   float uv_origin[2];
+   float image_init[2];
+-  paint_2d_transform_mouse(v2d, mouse_init, image_init);
++  paint_2d_transform_mouse_rotated(v2d, mouse_init, image_init, rotation_cos, rotation_sin, pivot);
+ 
+   int tile_number = BKE_image_get_tile_from_pos(ima, image_init, image_init, uv_origin);
+ 
+@@ -2071,8 +2266,13 @@ void paint_2d_gradient_fill(
+     return;
+   }
+ 
+-  paint_2d_transform_mouse(s->v2d, mouse_final, image_final);
+-  paint_2d_transform_mouse(s->v2d, mouse_init, image_init);
++  float rotation_cos = sima->rotation_cos;
++  float rotation_sin = sima->rotation_sin;
++  float pivot[2] = {sima->rotation_pivot[0], sima->rotation_pivot[1]};
++  paint_2d_transform_mouse_rotated(
++      s->v2d, mouse_final, image_final, rotation_cos, rotation_sin, pivot);
++  paint_2d_transform_mouse_rotated(
++      s->v2d, mouse_init, image_init, rotation_cos, rotation_sin, pivot);
+   sub_v2_v2(image_init, uv_origin);
+   sub_v2_v2(image_final, uv_origin);
+ 
+diff --git a/source/blender/editors/sculpt_paint/paint_cursor.cc b/source/blender/editors/sculpt_paint/paint_cursor.cc
+index 748c5ef0ece..11c83540f06 100644
+--- a/source/blender/editors/sculpt_paint/paint_cursor.cc
++++ b/source/blender/editors/sculpt_paint/paint_cursor.cc
+@@ -530,10 +530,29 @@ static bool paint_draw_tex_overlay(Paint *paint,
+           paint_runtime->draw_anchored ? paint_runtime->anchored_initial_mouse[1] : y,
+       };
+ 
+-      /* Brush rotation. */
++      float brush_rot = primary ? paint_runtime->brush_rotation :
++                                  paint_runtime->brush_rotation_sec;
++      float total_rotation = brush_rot;
++
++      {
++        static bool did_print = false;
++        static float last_brush_rot = 0.0f;
++        static float last_mtex_rot = 0.0f;
++        if (!did_print || last_mtex_rot != mtex->rot || last_brush_rot != brush_rot) {
++          did_print = true;
++          last_brush_rot = brush_rot;
++          last_mtex_rot = mtex->rot;
++          printf("[TexOverlay] map=%d mode=%d mtex.rot=%.2f brush=%.2f total=%.2f (deg)\n",
++                 int(mtex->brush_map_mode),
++                 int(mode),
++                 mtex->rot * 180.0f / M_PI,
++                 brush_rot * 180.0f / M_PI,
++                 total_rotation * 180.0f / M_PI);
++        }
++      }
++
+       GPU_matrix_translate_2fv(center);
+-      GPU_matrix_rotate_2d(
+-          RAD2DEGF(primary ? paint_runtime->brush_rotation : paint_runtime->brush_rotation_sec));
++      GPU_matrix_rotate_2d(RAD2DEGF(total_rotation));
+       GPU_matrix_translate_2f(-center[0], -center[1]);
+ 
+       /* Scale based on tablet pressure. */
+diff --git a/source/blender/editors/sculpt_paint/paint_stroke.cc b/source/blender/editors/sculpt_paint/paint_stroke.cc
+index 61409b6a6fd..e600a2201e2 100644
+--- a/source/blender/editors/sculpt_paint/paint_stroke.cc
++++ b/source/blender/editors/sculpt_paint/paint_stroke.cc
+@@ -402,6 +402,12 @@ bool PaintStroke::update(bContext *C,
+     }
+   }
+ 
++  if (do_random_mask) {
++    if (ELEM(brush.mask_mtex.brush_map_mode, MTEX_MAP_MODE_VIEW, MTEX_MAP_MODE_RANDOM)) {
++      paint_runtime.brush_rotation_sec += brush.mask_mtex.rot;
++    }
++  }
++
+   if (!location_sampled) {
+     if (mode != PaintMode::Texture2D) {
+       if (this->get_location(r_location, mouse, original_)) {
+diff --git a/source/blender/editors/sculpt_paint/sculpt_uv.cc b/source/blender/editors/sculpt_paint/sculpt_uv.cc
+index 9f659a4d6ef..ca814508155 100644
+--- a/source/blender/editors/sculpt_paint/sculpt_uv.cc
++++ b/source/blender/editors/sculpt_paint/sculpt_uv.cc
+@@ -494,9 +494,8 @@ static void uv_sculpt_stroke_apply(bContext *C,
+   float alpha = sculptdata->uvsculpt->strength;
+ 
+   float co[2];
+-  ui::view2d_region_to_view(&region->v2d, event->mval[0], event->mval[1], &co[0], &co[1]);
+-
+   SpaceImage *sima = CTX_wm_space_image(C);
++  ED_image_mouse_pos_rotated(sima, region, event->mval, co);
+ 
+   int width, height;
+   ED_space_image_get_size(sima, &width, &height);
+@@ -706,8 +705,10 @@ static UvSculptData *uv_sculpt_stroke_init(bContext *C, wmOperator *op, const wm
+     return nullptr;
+   }
+ 
++  SpaceImage *sima = CTX_wm_space_image(C);
++
+   /* Mouse coordinates, useful for some functions like grab and sculpt all islands */
+-  ui::view2d_region_to_view(&region->v2d, event->mval[0], event->mval[1], &co[0], &co[1]);
++  ED_image_mouse_pos_rotated(sima, region, event->mval, co);
+ 
+   /* We need to find the active island here. */
+   if (do_island_optimization) {
+@@ -855,7 +856,6 @@ static UvSculptData *uv_sculpt_stroke_init(bContext *C, wmOperator *op, const wm
+     }
+   }
+ 
+-  SpaceImage *sima = CTX_wm_space_image(C);
+   data->constrain_to_bounds = (sima->flag & SI_CLIP_UV);
+   BKE_image_find_nearest_tile_with_offset(sima->image, co, data->uv_base_offset);
+ 
+diff --git a/source/blender/editors/space_image/CMakeLists.txt b/source/blender/editors/space_image/CMakeLists.txt
+index b4bc2e1bd89..de03440f953 100644
+--- a/source/blender/editors/space_image/CMakeLists.txt
++++ b/source/blender/editors/space_image/CMakeLists.txt
+@@ -15,15 +15,15 @@ set(INC_SYS
+ )
+ 
+ set(SRC
+-  image_buttons.cc
+-  image_draw.cc
+-  image_edit.cc
+-  image_ops.cc
+-  image_sequence.cc
+-  image_undo.cc
+-  space_image.cc
++    image_buttons.cc
++    image_draw.cc
++    image_edit.cc
++    image_ops.cc
++    image_sequence.cc
++    image_undo.cc
++    space_image.cc
+ 
+-  image_intern.hh
++    image_intern.hh
+ )
+ 
+ set(LIB
+diff --git a/source/blender/editors/space_image/image_edit.cc b/source/blender/editors/space_image/image_edit.cc
+index 5adadf10fb3..c5b599045a6 100644
+--- a/source/blender/editors/space_image/image_edit.cc
++++ b/source/blender/editors/space_image/image_edit.cc
+@@ -6,12 +6,16 @@
+  * \ingroup spimage
+  */
+ 
++#include <cstdio>
++
+ #include "DNA_brush_types.h"
+ #include "DNA_mask_types.h"
+ #include "DNA_object_types.h"
+ #include "DNA_scene_types.h"
++#include "DNA_space_enums.h"
+ 
+ #include "BLI_listbase.h"
++#include "BLI_math_vector.h"
+ #include "BLI_rect.h"
+ 
+ #include "BKE_colortools.hh"
+@@ -391,6 +395,213 @@ void ED_image_point_pos__reverse(SpaceImage *sima,
+   r_co[1] = (co[1] * height * zoomy) + float(sy);
+ }
+ 
++/* -------------------------------------------------------------------- */
++/** \name Const Versions of Coordinate Conversion Functions
++ *
++ * These functions accept const SpaceImage* for use in rotation wrappers
++ * and other contexts where the space data should not be modified.
++ * \{ */
++
++void ED_image_mouse_pos_const(const SpaceImage *sima,
++                              const ARegion *region,
++                              const int mval[2],
++                              float co[2])
++{
++  int sx, sy, width, height;
++  float zoomx, zoomy;
++
++  ED_space_image_get_zoom(const_cast<SpaceImage *>(sima), region, &zoomx, &zoomy);
++  ED_space_image_get_size(const_cast<SpaceImage *>(sima), &width, &height);
++
++  ui::view2d_view_to_region(&region->v2d, 0.0f, 0.0f, &sx, &sy);
++
++  co[0] = ((mval[0] - sx) / zoomx) / width;
++  co[1] = ((mval[1] - sy) / zoomy) / height;
++}
++
++void ED_image_point_pos_const(
++    const SpaceImage *sima, const ARegion *region, float x, float y, float *r_x, float *r_y)
++{
++  int sx, sy, width, height;
++  float zoomx, zoomy;
++
++  ED_space_image_get_zoom(const_cast<SpaceImage *>(sima), region, &zoomx, &zoomy);
++  ED_space_image_get_size(const_cast<SpaceImage *>(sima), &width, &height);
++
++  ui::view2d_view_to_region(&region->v2d, 0.0f, 0.0f, &sx, &sy);
++
++  *r_x = ((x - sx) / zoomx) / width;
++  *r_y = ((y - sy) / zoomy) / height;
++}
++
++void ED_image_point_pos__reverse_const(const SpaceImage *sima,
++                                       const ARegion *region,
++                                       const float co[2],
++                                       float r_co[2])
++{
++  float zoomx, zoomy;
++  int width, height;
++  int sx, sy;
++
++  ui::view2d_view_to_region(&region->v2d, 0.0f, 0.0f, &sx, &sy);
++  ED_space_image_get_size(const_cast<SpaceImage *>(sima), &width, &height);
++  ED_space_image_get_zoom(const_cast<SpaceImage *>(sima), region, &zoomx, &zoomy);
++
++  r_co[0] = (co[0] * width * zoomx) + float(sx);
++  r_co[1] = (co[1] * height * zoomy) + float(sy);
++}
++
++/** \} */
++
++/* -------------------------------------------------------------------- */
++/** \name Coordinate Wrappers with Rotation Support
++ *
++ * These functions compensate for canvas rotation when converting between
++ * screen coordinates and image/UV coordinates.
++ *
++ * The GPU pipeline rotates the visual representation, so we need to apply
++ * the inverse rotation to input coordinates to make tools work correctly
++ * when the canvas is rotated.
++ *
++ * Pivot point: (0.5, 0.5) in UV space - center of the image.
++ * \{ */
++
++void ED_image_mouse_pos_rotated(const SpaceImage *sima,
++                                const ARegion *region,
++                                const int mval[2],
++                                float r_co[2])
++{
++  if (sima->rotation != 0.0f) {
++    float pivot_uv[2] = {sima->rotation_pivot[0], sima->rotation_pivot[1]};
++    float pivot_screen[2];
++    ED_image_point_pos__reverse_const(sima, region, pivot_uv, pivot_screen);
++
++    float unrotated_screen[2] = {float(mval[0]), float(mval[1])};
++    /* Use cached sin/cos: cos(-θ) = cos(θ), sin(-θ) = -sin(θ) */
++    const float cos_r = sima->rotation_cos;
++    const float sin_r = -sima->rotation_sin;
++
++    const float dx = unrotated_screen[0] - pivot_screen[0];
++    const float dy = unrotated_screen[1] - pivot_screen[1];
++
++    unrotated_screen[0] = pivot_screen[0] + dx * cos_r - dy * sin_r;
++    unrotated_screen[1] = pivot_screen[1] + dx * sin_r + dy * cos_r;
++
++    ED_image_point_pos_const(
++        sima, region, unrotated_screen[0], unrotated_screen[1], &r_co[0], &r_co[1]);
++    return;
++  }
++
++  ED_image_mouse_pos_const(sima, region, mval, r_co);
++}
++
++void ED_image_view_to_region_rotated(const SpaceImage *sima,
++                                     const ARegion *region,
++                                     const float co[2],
++                                     float r_co[2])
++{
++  ED_image_point_pos__reverse_const(sima, region, co, r_co);
++
++  if (sima->rotation == 0.0f) {
++    return;
++  }
++
++  float pivot_uv[2] = {sima->rotation_pivot[0], sima->rotation_pivot[1]};
++  float pivot_screen[2];
++  ED_image_point_pos__reverse_const(sima, region, pivot_uv, pivot_screen);
++
++  /* Use cached sin/cos values */
++  const float cos_r = sima->rotation_cos;
++  const float sin_r = sima->rotation_sin;
++  const float dx = r_co[0] - pivot_screen[0];
++  const float dy = r_co[1] - pivot_screen[1];
++
++  r_co[0] = pivot_screen[0] + dx * cos_r - dy * sin_r;
++  r_co[1] = pivot_screen[1] + dx * sin_r + dy * cos_r;
++}
++
++void ED_image_point_pos_rotated(
++    SpaceImage *sima, const ARegion *region, float x, float y, float *r_x, float *r_y)
++{
++  if (sima->rotation != 0.0f) {
++    float pivot_uv[2] = {sima->rotation_pivot[0], sima->rotation_pivot[1]};
++    float pivot_screen[2];
++    ED_image_point_pos__reverse(sima, region, pivot_uv, pivot_screen);
++
++    float unrotated_screen[2] = {x, y};
++    /* Use cached sin/cos: cos(-θ) = cos(θ), sin(-θ) = -sin(θ) */
++    const float cos_r = sima->rotation_cos;
++    const float sin_r = -sima->rotation_sin;
++    const float dx = unrotated_screen[0] - pivot_screen[0];
++    const float dy = unrotated_screen[1] - pivot_screen[1];
++
++    unrotated_screen[0] = pivot_screen[0] + dx * cos_r - dy * sin_r;
++    unrotated_screen[1] = pivot_screen[1] + dx * sin_r + dy * cos_r;
++
++    ED_image_point_pos(sima, region, unrotated_screen[0], unrotated_screen[1], r_x, r_y);
++    return;
++  }
++
++  ED_image_point_pos(sima, region, x, y, r_x, r_y);
++}
++
++void ED_image_point_pos__reverse_rotated(SpaceImage *sima,
++                                         const ARegion *region,
++                                         const float co[2],
++                                         float r_co[2])
++{
++  ED_image_point_pos__reverse(sima, region, co, r_co);
++
++  if (sima->rotation == 0.0f) {
++    return;
++  }
++
++  float pivot_uv[2] = {sima->rotation_pivot[0], sima->rotation_pivot[1]};
++  float pivot_screen[2];
++  ED_image_point_pos__reverse(sima, region, pivot_uv, pivot_screen);
++
++  /* Apply INVERSE rotation to compensate for canvas rotation.
++   * Canvas is rotated by sima->rotation, so we need to rotate by -sima->rotation.
++   * cos(-θ) = cos(θ), sin(-θ) = -sin(θ) */
++  const float cos_r = sima->rotation_cos;      /* cos(-θ) = cos(θ) */
++  const float neg_sin_r = -sima->rotation_sin; /* sin(-θ) = -sin(θ) */
++  const float dx = r_co[0] - pivot_screen[0];
++  const float dy = r_co[1] - pivot_screen[1];
++
++  /* Apply inverse rotation matrix */
++  float rotated_x = pivot_screen[0] + dx * cos_r - dy * neg_sin_r;
++  float rotated_y = pivot_screen[1] + dx * neg_sin_r + dy * cos_r;
++
++  r_co[0] = rotated_x;
++  r_co[1] = rotated_y;
++}
++
++/** \} */
++
++/* -------------------------------------------------------------------- */
++/** \name Rotation Cache
++ *
++ * Cached sin/cos values for canvas rotation to avoid repeated calculations.
++ * \{ */
++
++void ED_space_image_rotation_cache_update(SpaceImage *sima)
++{
++  sima->rotation_sin = sinf(sima->rotation);
++  sima->rotation_cos = cosf(sima->rotation);
++}
++
++bool ED_space_image_rotation_supported(const SpaceImage *sima)
++{
++  if (sima == nullptr) {
++    return false;
++  }
++  /* Rotation is supported in View, Paint, and Mask modes.
++   * Rotation is NOT supported in UV Editor mode. */
++  return ELEM(sima->mode, SI_MODE_VIEW, SI_MODE_PAINT, SI_MODE_MASK);
++}
++
++/** \} */
++
+ bool ED_image_slot_cycle(Image *image, int direction)
+ {
+   const int cur = image->render_slot;
+diff --git a/source/blender/editors/space_image/image_intern.hh b/source/blender/editors/space_image/image_intern.hh
+index f5277a29d57..636ca627770 100644
+--- a/source/blender/editors/space_image/image_intern.hh
++++ b/source/blender/editors/space_image/image_intern.hh
+@@ -48,6 +48,10 @@ void IMAGE_OT_view_zoom_in(wmOperatorType *ot);
+ void IMAGE_OT_view_zoom_out(wmOperatorType *ot);
+ void IMAGE_OT_view_zoom_ratio(wmOperatorType *ot);
+ void IMAGE_OT_view_zoom_border(wmOperatorType *ot);
++void IMAGE_OT_view_rotate_cw(wmOperatorType *ot);
++void IMAGE_OT_view_rotate_ccw(wmOperatorType *ot);
++void IMAGE_OT_view_rotate_reset(wmOperatorType *ot);
++void IMAGE_OT_view_rotate_interactive(wmOperatorType *ot);
+ #ifdef WITH_INPUT_NDOF
+ void IMAGE_OT_view_ndof(wmOperatorType *ot);
+ #endif
+diff --git a/source/blender/editors/space_image/image_ops.cc b/source/blender/editors/space_image/image_ops.cc
+index 75df1dfb90c..b509cbf2594 100644
+--- a/source/blender/editors/space_image/image_ops.cc
++++ b/source/blender/editors/space_image/image_ops.cc
+@@ -6,8 +6,10 @@
+  * \ingroup spimage
+  */
+ 
++#include <algorithm>
+ #include <cerrno>
+ #include <cstddef>
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <fcntl.h>
+@@ -20,8 +22,11 @@
+ 
+ #include "MEM_guardedalloc.h"
+ 
++#include "BLI_dial_2d.h"
+ #include "BLI_fileops.h"
+ #include "BLI_listbase.h"
++#include "BLI_math_rotation.h"
++#include "BLI_math_vector_types.hh"
+ #include "BLI_path_utils.hh"
+ #include "BLI_set.hh"
+ #include "BLI_string.h"
+@@ -35,6 +40,7 @@
+ #include "DNA_object_types.h"
+ #include "DNA_scene_types.h"
+ #include "DNA_screen_types.h"
++#include "DNA_space_enums.h"
+ 
+ #include "BKE_colortools.hh"
+ #include "BKE_context.hh"
+@@ -83,6 +89,12 @@
+ #include "UI_resources.hh"
+ #include "UI_view2d.hh"
+ 
++#include "BLF_api.hh"
++
++#include "GPU_immediate.hh"
++#include "GPU_matrix.hh"
++#include "GPU_state.hh"
++
+ #include "WM_api.hh"
+ #include "WM_types.hh"
+ 
+@@ -349,6 +361,15 @@ bool space_image_main_region_poll(bContext *C)
+   return false;
+ }
+ 
++/** Poll function for canvas rotation operators.
++ * Rotation is only supported in View, Paint, and Mask modes.
++ */
++bool space_image_rotation_poll(bContext *C)
++{
++  SpaceImage *sima = CTX_wm_space_image(C);
++  return ED_space_image_rotation_supported(sima);
++}
++
+ /** For #IMAGE_OT_curves_point_set to avoid sampling when in uv smooth mode or edit-mode. */
+ static bool space_image_main_area_not_uv_brush_poll(bContext *C)
+ {
+@@ -1254,7 +1275,34 @@ static wmOperatorStatus image_view_zoom_border_exec(bContext *C, wmOperator *op)
+ 
+   WM_operator_properties_border_to_rctf(op, &bounds);
+ 
+-  ui::view2d_region_to_view_rctf(&region->v2d, &bounds, &bounds);
++  /* Apply rotation compensation for zoom border. */
++  if (sima && sima->rotation != 0.0f) {
++    int corners[4][2] = {
++        {int(bounds.xmin), int(bounds.ymin)},
++        {int(bounds.xmax), int(bounds.ymin)},
++        {int(bounds.xmax), int(bounds.ymax)},
++        {int(bounds.xmin), int(bounds.ymax)},
++    };
++    float uv_corners[4][2];
++    float uv_min[2] = {FLT_MAX, FLT_MAX};
++    float uv_max[2] = {-FLT_MAX, -FLT_MAX};
++
++    for (int i = 0; i < 4; i++) {
++      ED_image_mouse_pos_rotated(sima, region, corners[i], uv_corners[i]);
++      uv_min[0] = std::min(uv_min[0], uv_corners[i][0]);
++      uv_min[1] = std::min(uv_min[1], uv_corners[i][1]);
++      uv_max[0] = std::max(uv_max[0], uv_corners[i][0]);
++      uv_max[1] = std::max(uv_max[1], uv_corners[i][1]);
++    }
++
++    bounds.xmin = uv_min[0];
++    bounds.ymin = uv_min[1];
++    bounds.xmax = uv_max[0];
++    bounds.ymax = uv_max[1];
++  }
++  else {
++    ui::view2d_region_to_view_rctf(&region->v2d, &bounds, &bounds);
++  }
+ 
+   struct {
+     float xof;
+@@ -1298,6 +1346,936 @@ void IMAGE_OT_view_zoom_border(wmOperatorType *ot)
+   WM_operator_properties_gesture_box_zoom(ot);
+ }
+ 
++/** \} */
++
++/* -------------------------------------------------------------------- */
++/** \name View Rotate Operators
++ * \{ */
++
++/**
++ * Normalize rotation angle to [-PI, PI] range.
++ * This prevents angle overflow and ensures consistent behavior.
++ */
++static void normalize_rotation_angle(float &rotation)
++{
++  while (rotation > float(M_PI)) {
++    rotation -= 2.0f * float(M_PI);
++  }
++  while (rotation < -float(M_PI)) {
++    rotation += 2.0f * float(M_PI);
++  }
++}
++
++static wmOperatorStatus image_view_rotate_cw_exec(bContext *C, wmOperator * /*op*/)
++{
++  SpaceImage *sima = CTX_wm_space_image(C);
++  ARegion *region = CTX_wm_region(C);
++
++  sima->rotation -= DEG2RADF(90.0f);
++  normalize_rotation_angle(sima->rotation);
++  ED_space_image_rotation_cache_update(sima);
++
++  ED_region_tag_redraw(region);
++  return OPERATOR_FINISHED;
++}
++
++void IMAGE_OT_view_rotate_cw(wmOperatorType *ot)
++{
++  ot->name = "Rotate View 90° Clockwise";
++  ot->idname = "IMAGE_OT_view_rotate_cw";
++  ot->description = "Rotate the canvas view 90 degrees clockwise";
++
++  ot->exec = image_view_rotate_cw_exec;
++  ot->poll = space_image_rotation_poll;
++
++  ot->flag = OPTYPE_REGISTER;
++}
++
++static wmOperatorStatus image_view_rotate_ccw_exec(bContext *C, wmOperator * /*op*/)
++{
++  SpaceImage *sima = CTX_wm_space_image(C);
++  ARegion *region = CTX_wm_region(C);
++
++  sima->rotation += DEG2RADF(90.0f);
++  normalize_rotation_angle(sima->rotation);
++  ED_space_image_rotation_cache_update(sima);
++
++  ED_region_tag_redraw(region);
++  return OPERATOR_FINISHED;
++}
++
++void IMAGE_OT_view_rotate_ccw(wmOperatorType *ot)
++{
++  ot->name = "Rotate View 90° Counter-Clockwise";
++  ot->idname = "IMAGE_OT_view_rotate_ccw";
++  ot->description = "Rotate the canvas view 90 degrees counter-clockwise";
++
++  ot->exec = image_view_rotate_ccw_exec;
++  ot->poll = space_image_rotation_poll;
++
++  ot->flag = OPTYPE_REGISTER;
++}
++
++static wmOperatorStatus image_view_rotate_reset_exec(bContext *C, wmOperator * /*op*/)
++{
++  SpaceImage *sima = CTX_wm_space_image(C);
++  ARegion *region = CTX_wm_region(C);
++
++  sima->rotation = 0.0f;
++  ED_space_image_rotation_cache_update(sima);
++
++  ED_region_tag_redraw(region);
++  return OPERATOR_FINISHED;
++}
++
++void IMAGE_OT_view_rotate_reset(wmOperatorType *ot)
++{
++  ot->name = "Reset View Rotation";
++  ot->idname = "IMAGE_OT_view_rotate_reset";
++  ot->description = "Reset the canvas rotation to default";
++
++  ot->exec = image_view_rotate_reset_exec;
++  ot->poll = space_image_rotation_poll;
++
++  ot->flag = OPTYPE_REGISTER;
++}
++
++/** \name View Rotate Interactive Operator
++ * \{ */
++
++struct ImageRotateInteractiveData {
++  float initial_rotation;
++  float initial_pivot[2]; /* Saved pivot to restore on cancel */
++  float initial_offset[2];
++  float current_pivot[2]; /* Pivot point in UV space (under cursor) */
++  float pivot_screen[2];  /* Pivot point in screen coordinates (fixed for drawing) */
++  Dial *dial;
++  short init_event_type;
++  wmPaintCursor *cursor; /* Paint cursor for drawing pivot point */
++  bool use_center_pivot; /* True = rotate around image center, False = rotate around cursor */
++};
++
++/* Draw the pivot point indicator with X/Y axis lines (for center rotation) */
++static void image_rotate_draw_pivot(bContext *C,
++                                    const int2 & /*xy*/,
++                                    const float2 & /*tilt*/,
++                                    void *customdata)
++{
++  ImageRotateInteractiveData *data = static_cast<ImageRotateInteractiveData *>(customdata);
++  if (data == nullptr) {
++    return;
++  }
++
++  SpaceImage *sima = CTX_wm_space_image(C);
++  if (sima == nullptr) {
++    return;
++  }
++
++  /* Safety: unbind any shader left bound by previous paint cursor. */
++  if (immIsShaderBound()) {
++    immUnbindProgram();
++  }
++
++  /* Switch to pixel space for constant-size drawing regardless of zoom. */
++  ARegion *region = CTX_wm_region(C);
++  GPU_matrix_push_projection();
++  GPU_matrix_push();
++  wmViewport(&region->winrct);
++
++  /* DEBUG: Check coordinate values */
++
++  /* Translate to pivot position in screen coordinates. */
++  GPU_matrix_translate_2f(data->pivot_screen[0] - region->winrct.xmin,
++                          data->pivot_screen[1] - region->winrct.ymin);
++
++  GPU_line_width(2.0f);
++
++  const float size = 36.0f;
++  const float arrow_size = 12.0f;
++
++  /* Helper function to draw axis lines at current matrix position.
++   * Draws rotated X/Y axes to show image orientation. */
++  auto draw_axis_indicator = [&](bool show_labels, float scale_factor = 1.0f) {
++    const float axis_size = 100.0f * scale_factor;
++    const float axis_handle_size = 0.12f;
++    const float rotation = sima->rotation;
++    const float cos_r = cosf(rotation);
++    const float sin_r = sinf(rotation);
++
++    /* X axis direction (rotated) */
++    const float x_dir[2] = {cos_r, sin_r};
++    /* Y axis direction (perpendicular to X) */
++    const float y_dir[2] = {-sin_r, cos_r};
++
++    /* Calculate axis endpoint in pixel coordinates (line length without handle). */
++    const float axis_length = axis_size * (1.0f - axis_handle_size);
++    float x_end[2] = {x_dir[0] * axis_length, x_dir[1] * axis_length};
++    float y_end[2] = {y_dir[0] * axis_length, y_dir[1] * axis_length};
++
++    /* Circle and label positions are offset by radius to avoid overlapping with lines. */
++    const float rad = axis_size * axis_handle_size;
++    const float circle_distance = axis_length + rad;
++    float x_end_circle[2] = {x_dir[0] * circle_distance, x_dir[1] * circle_distance};
++    float y_end_circle[2] = {y_dir[0] * circle_distance, y_dir[1] * circle_distance};
++
++    /* Enable smooth lines for anti-aliasing. */
++    GPU_blend(GPU_BLEND_ALPHA);
++    GPU_line_smooth(true);
++
++    /* Get vertex format attributes first. */
++    GPUVertFormat *format = immVertexFormat();
++    uint pos = GPU_vertformat_attr_add(format, "pos", gpu::VertAttrType::SFLOAT_32_32);
++    uint color_id = GPU_vertformat_attr_add(
++        format, "color", gpu::VertAttrType::SFLOAT_32_32_32_32);
++
++    float viewport_size[4];
++    GPU_viewport_size_get_f(viewport_size);
++
++    /* Draw X axis line (RED) - only positive direction */
++    immBindBuiltinProgram(GPU_SHADER_3D_POLYLINE_SMOOTH_COLOR);
++    immUniform2fv("viewportSize", &viewport_size[2]);
++    immUniform1f("lineWidth", 2.0f * scale_factor);
++    immUniform1i("lineSmooth", 1);
++
++    float x_center_color[4] = {0.9f, 0.2f, 0.2f, 0.6f};
++    float x_end_color[4] = {0.9f, 0.2f, 0.2f, 1.0f};
++    immBegin(GPU_PRIM_LINES, 2);
++    immAttr4fv(color_id, x_center_color);
++    immVertex2f(pos, 0.0f, 0.0f);
++    immAttr4fv(color_id, x_end_color);
++    immVertex2f(pos, x_end[0], x_end[1]);
++    immEnd();
++    immUnbindProgram();
++
++    /* Draw Y axis line (GREEN) - only positive direction */
++    immBindBuiltinProgram(GPU_SHADER_3D_POLYLINE_SMOOTH_COLOR);
++    immUniform2fv("viewportSize", &viewport_size[2]);
++    immUniform1f("lineWidth", 2.0f * scale_factor);
++    immUniform1i("lineSmooth", 1);
++
++    float y_center_color[4] = {0.2f, 0.9f, 0.2f, 0.6f};
++    float y_end_color[4] = {0.2f, 0.9f, 0.2f, 1.0f};
++    immBegin(GPU_PRIM_LINES, 2);
++    immAttr4fv(color_id, y_center_color);
++    immVertex2f(pos, 0.0f, 0.0f);
++    immAttr4fv(color_id, y_end_color);
++    immVertex2f(pos, y_end[0], y_end[1]);
++    immEnd();
++    immUnbindProgram();
++
++    /* Draw small crosshair at center (white). */
++    const float cross_size = 6.0f * scale_factor;
++    uint pos_outer = GPU_vertformat_attr_add(
++        immVertexFormat(), "pos", gpu::VertAttrType::SFLOAT_32_32);
++    immBindBuiltinProgram(GPU_SHADER_3D_UNIFORM_COLOR);
++    immUniformColor3f(1.0f, 1.0f, 1.0f);
++    immBegin(GPU_PRIM_LINES, 4);
++    immVertex2f(pos_outer, -cross_size * x_dir[0], -cross_size * x_dir[1]);
++    immVertex2f(pos_outer, cross_size * x_dir[0], cross_size * x_dir[1]);
++    immVertex2f(pos_outer, -cross_size * y_dir[0], -cross_size * y_dir[1]);
++    immVertex2f(pos_outer, cross_size * y_dir[0], cross_size * y_dir[1]);
++    immEnd();
++    immUnbindProgram();
++
++    GPU_line_smooth(false);
++
++    /* Draw axis end circles. */
++    const float axis_ring_width = 1.5f * scale_factor;
++    const float x_color[3] = {0.9f, 0.2f, 0.2f}; /* Red */
++    const float y_color[3] = {0.2f, 0.9f, 0.2f}; /* Green */
++
++    auto draw_axis_circle = [&](const float *center, const float color[3]) {
++      ui::draw_roundbox_corner_set(ui::CNR_ALL);
++      GPU_matrix_push();
++      GPU_matrix_translate_2fv(center);
++
++      rctf rect{};
++      rect.xmin = -rad;
++      rect.xmax = rad;
++      rect.ymin = -rad;
++      rect.ymax = rad;
++
++      float center_color[4] = {color[0], color[1], color[2], 1.0f};
++      float outline_color[4] = {color[0], color[1], color[2], 1.0f};
++
++      ui::draw_roundbox_4fv(&rect, true, rad, center_color);
++      ui::draw_roundbox_4fv_ex(
++          &rect, center_color, nullptr, 0.0f, outline_color, axis_ring_width, rad);
++
++      GPU_matrix_pop();
++    };
++
++    /* Draw circles at axis ends (+X, +Y only). */
++    draw_axis_circle(x_end_circle, x_color);
++    draw_axis_circle(y_end_circle, y_color);
++
++    /* Draw axis labels if requested. */
++    if (show_labels) {
++      const int font_id = BLF_default();
++      BLF_enable(font_id, BLF_BOLD);
++      BLF_size(font_id, int(14.0f * scale_factor));
++
++      struct {
++        const float *v;
++        const char *label;
++      } labels[] = {
++          {x_end_circle, "+X"},
++          {y_end_circle, "+Y"},
++      };
++
++      for (const auto &label_data : labels) {
++        const float *v = label_data.v;
++        const char *label = label_data.label;
++
++        float text_width, text_height;
++        BLF_width_and_height(font_id, label, strlen(label), &text_width, &text_height);
++
++        float text_pos[2];
++        text_pos[0] = v[0] - text_width * 0.5f;
++        text_pos[1] = v[1] - text_height * 0.5f;
++
++        BLF_position(font_id, text_pos[0], text_pos[1], 0);
++
++        float text_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
++        BLF_color4fv(font_id, text_color);
++        BLF_draw(font_id, label, strlen(label));
++      }
++
++      BLF_disable(font_id, BLF_BOLD);
++    }
++
++    GPU_blend(GPU_BLEND_NONE);
++  };
++
++  if (data->use_center_pivot) {
++    /* Draw X and Y axis lines for center rotation mode (gizmo).
++     * Lines are rotated to match the current image rotation.
++     * This is the original visual style with full axis indicators. */
++    const float axis_size = 150.0f;
++    const float axis_handle_size = 0.1f;
++    const float rotation = sima->rotation;
++    const float cos_r = cosf(rotation);
++    const float sin_r = sinf(rotation);
++
++    /* X axis direction (rotated) */
++    const float x_dir[2] = {cos_r, sin_r};
++    /* Y axis direction (perpendicular to X) */
++    const float y_dir[2] = {-sin_r, cos_r};
++
++    /* Calculate axis endpoint in pixel coordinates (line length without handle). */
++    const float axis_length = axis_size * (1.0f - axis_handle_size);
++    float x_end[2] = {x_dir[0] * axis_length, x_dir[1] * axis_length};
++    float x_start[2] = {-x_dir[0] * axis_length, -x_dir[1] * axis_length};
++    float y_end[2] = {y_dir[0] * axis_length, y_dir[1] * axis_length};
++    float y_start[2] = {-y_dir[0] * axis_length, -y_dir[1] * axis_length};
++
++    /* Circle and label positions are offset by radius to avoid overlapping with lines. */
++    const float rad = axis_size * axis_handle_size;
++    const float circle_distance = axis_length + rad;
++    float x_end_circle[2] = {x_dir[0] * circle_distance, x_dir[1] * circle_distance};
++    float x_start_circle[2] = {-x_dir[0] * circle_distance, -x_dir[1] * circle_distance};
++    float y_end_circle[2] = {y_dir[0] * circle_distance, y_dir[1] * circle_distance};
++    float y_start_circle[2] = {-y_dir[0] * circle_distance, -y_dir[1] * circle_distance};
++
++    /* Enable smooth lines for anti-aliasing. */
++    GPU_blend(GPU_BLEND_ALPHA);
++    GPU_line_smooth(true);
++
++    /* Get vertex format attributes first. */
++    GPUVertFormat *format = immVertexFormat();
++    uint pos = GPU_vertformat_attr_add(format, "pos", gpu::VertAttrType::SFLOAT_32_32);
++    uint color_id = GPU_vertformat_attr_add(
++        format, "color", gpu::VertAttrType::SFLOAT_32_32_32_32);
++
++    float viewport_size[4];
++    GPU_viewport_size_get_f(viewport_size);
++
++    /* Draw X axis line (RED) with gradient */
++    immBindBuiltinProgram(GPU_SHADER_3D_POLYLINE_SMOOTH_COLOR);
++    immUniform2fv("viewportSize", &viewport_size[2]);
++    immUniform1f("lineWidth", 2.0f);
++    immUniform1i("lineSmooth", 1);
++
++    float x_center_color[4] = {0.9f, 0.2f, 0.2f, 0.6f};
++    float x_end_color[4] = {0.9f, 0.2f, 0.2f, 1.0f};
++    immBegin(GPU_PRIM_LINES, 4);
++    immAttr4fv(color_id, x_center_color);
++    immVertex2f(pos, 0.0f, 0.0f);
++    immAttr4fv(color_id, x_end_color);
++    immVertex2f(pos, x_end[0], x_end[1]);
++    immAttr4fv(color_id, x_center_color);
++    immVertex2f(pos, 0.0f, 0.0f);
++    immAttr4fv(color_id, x_end_color);
++    immVertex2f(pos, x_start[0], x_start[1]);
++    immEnd();
++    immUnbindProgram();
++
++    /* Draw Y axis line (GREEN) with gradient */
++    immBindBuiltinProgram(GPU_SHADER_3D_POLYLINE_SMOOTH_COLOR);
++    immUniform2fv("viewportSize", &viewport_size[2]);
++    immUniform1f("lineWidth", 2.0f);
++    immUniform1i("lineSmooth", 1);
++
++    float y_center_color[4] = {0.2f, 0.9f, 0.2f, 0.6f};
++    float y_end_color[4] = {0.2f, 0.9f, 0.2f, 1.0f};
++    immBegin(GPU_PRIM_LINES, 4);
++    immAttr4fv(color_id, y_center_color);
++    immVertex2f(pos, 0.0f, 0.0f);
++    immAttr4fv(color_id, y_end_color);
++    immVertex2f(pos, y_end[0], y_end[1]);
++    immAttr4fv(color_id, y_center_color);
++    immVertex2f(pos, 0.0f, 0.0f);
++    immAttr4fv(color_id, y_end_color);
++    immVertex2f(pos, y_start[0], y_start[1]);
++    immEnd();
++    immUnbindProgram();
++
++    /* Draw small crosshair at center (white). */
++    const float cross_size = 8.0f;
++    uint pos_outer = GPU_vertformat_attr_add(
++        immVertexFormat(), "pos", gpu::VertAttrType::SFLOAT_32_32);
++    immBindBuiltinProgram(GPU_SHADER_3D_UNIFORM_COLOR);
++    immUniformColor3f(1.0f, 1.0f, 1.0f);
++    immBegin(GPU_PRIM_LINES, 4);
++    immVertex2f(pos_outer, -cross_size * x_dir[0], -cross_size * x_dir[1]);
++    immVertex2f(pos_outer, cross_size * x_dir[0], cross_size * x_dir[1]);
++    immVertex2f(pos_outer, -cross_size * y_dir[0], -cross_size * y_dir[1]);
++    immVertex2f(pos_outer, cross_size * y_dir[0], cross_size * y_dir[1]);
++    immEnd();
++    immUnbindProgram();
++
++    GPU_line_smooth(false);
++
++    /* Draw axis end circles with semi-transparent center and colored ring. */
++    const float axis_ring_width = 1.5f;
++
++    auto draw_axis_circle = [&](const float *center, const float color[3], bool is_negative) {
++      ui::draw_roundbox_corner_set(ui::CNR_ALL);
++      GPU_matrix_push();
++      GPU_matrix_translate_2fv(center);
++
++      rctf rect{};
++      rect.xmin = -rad;
++      rect.xmax = rad;
++      rect.ymin = -rad;
++      rect.ymax = rad;
++
++      float center_alpha = is_negative ? 0.2f : 1.0f;
++      float center_color[4] = {color[0], color[1], color[2], center_alpha};
++      float outline_color[4] = {color[0], color[1], color[2], 1.0f};
++
++      ui::draw_roundbox_4fv(&rect, true, rad, center_color);
++      ui::draw_roundbox_4fv_ex(
++          &rect, center_color, nullptr, 0.0f, outline_color, axis_ring_width, rad);
++
++      GPU_matrix_pop();
++    };
++
++    const float x_color[3] = {0.9f, 0.2f, 0.2f};
++    const float y_color[3] = {0.2f, 0.9f, 0.2f};
++
++    draw_axis_circle(x_end_circle, x_color, false);
++    draw_axis_circle(x_start_circle, x_color, true);
++    draw_axis_circle(y_end_circle, y_color, false);
++    draw_axis_circle(y_start_circle, y_color, true);
++
++    /* Draw axis labels (+X, +Y). */
++    const int font_id = BLF_default();
++    BLF_enable(font_id, BLF_BOLD);
++    BLF_size(font_id, 12);
++
++    struct {
++      const float *v;
++      const char *label;
++    } labels[] = {
++        {x_end_circle, "+X"},
++        {y_end_circle, "+Y"},
++    };
++
++    for (const auto &label_data : labels) {
++      const float *v = label_data.v;
++      const char *label = label_data.label;
++
++      float text_width, text_height;
++      BLF_width_and_height(font_id, label, strlen(label), &text_width, &text_height);
++
++      float text_pos[2];
++      text_pos[0] = v[0] - text_width * 0.5f;
++      text_pos[1] = v[1] - text_height * 0.5f;
++
++      BLF_position(font_id, text_pos[0], text_pos[1], 0);
++
++      float text_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
++      BLF_color4fv(font_id, text_color);
++      BLF_draw(font_id, label, strlen(label));
++    }
++
++    BLF_disable(font_id, BLF_BOLD);
++    GPU_blend(GPU_BLEND_NONE);
++  }
++  else {
++    /* Draw rotation arc with arrow for cursor rotation mode (Alt+Click).
++     * Use blue color (#4772B3FF) for cursor mode. */
++    GPU_blend(GPU_BLEND_ALPHA);
++    GPU_line_smooth(true);
++
++    /* Blue color #4772B3FF */
++    const float blue_color[3] = {71.0f / 255.0f, 114.0f / 255.0f, 179.0f / 255.0f};
++
++    uint pos = GPU_vertformat_attr_add(immVertexFormat(), "pos", gpu::VertAttrType::SFLOAT_32_32);
++    immBindBuiltinProgram(GPU_SHADER_3D_UNIFORM_COLOR);
++    immUniformColor3fv(blue_color);
++
++    /* Draw crosshair lines. */
++    const float cross_size = 15.0f;
++    immBegin(GPU_PRIM_LINES, 4);
++    immVertex2f(pos, -cross_size, 0.0f);
++    immVertex2f(pos, cross_size, 0.0f);
++    immVertex2f(pos, 0.0f, -cross_size);
++    immVertex2f(pos, 0.0f, cross_size);
++    immEnd();
++
++    immUnbindProgram();
++
++    /* Draw rotation arc with arrow (3/4 circle). */
++    immBindBuiltinProgram(GPU_SHADER_3D_POLYLINE_UNIFORM_COLOR);
++    immUniformColor3fv(blue_color);
++    float viewport[4];
++    GPU_viewport_size_get_f(viewport);
++    immUniform2fv("viewportSize", &viewport[2]);
++    immUniform1f("lineWidth", 2.0f * UI_SCALE_FAC);
++    immUniform1i("lineSmooth", 1);
++
++    const int arc_segments = 24;
++    const float start_angle = -0.75f * M_PI;
++    const float end_angle = 0.75f * M_PI;
++    const float angle_step = (end_angle - start_angle) / arc_segments;
++
++    immBegin(GPU_PRIM_LINE_STRIP, arc_segments + 1);
++    for (int i = 0; i <= arc_segments; i++) {
++      float angle = start_angle + float(i) * angle_step;
++      immVertex2f(pos, cosf(angle) * size, sinf(angle) * size);
++    }
++    immEnd();
++
++    /* Draw arrow head at end of arc. */
++    immUnbindProgram();
++    uint pos2 = GPU_vertformat_attr_add(immVertexFormat(), "pos", gpu::VertAttrType::SFLOAT_32_32);
++    immBindBuiltinProgram(GPU_SHADER_3D_UNIFORM_COLOR);
++    immUniformColor3fv(blue_color);
++    GPU_line_width(2.0f);
++
++    const float back_angle = end_angle - float(M_PI_2);
++    const float arrow_x = cosf(end_angle) * size;
++    const float arrow_y = sinf(end_angle) * size;
++    const float half_arrow_angle = 0.4f;
++
++    immBegin(GPU_PRIM_LINES, 4);
++    immVertex2f(pos2, arrow_x, arrow_y);
++    immVertex2f(pos2,
++                arrow_x + cosf(back_angle - half_arrow_angle) * arrow_size,
++                arrow_y + sinf(back_angle - half_arrow_angle) * arrow_size);
++    immVertex2f(pos2, arrow_x, arrow_y);
++    immVertex2f(pos2,
++                arrow_x + cosf(back_angle + half_arrow_angle) * arrow_size,
++                arrow_y + sinf(back_angle + half_arrow_angle) * arrow_size);
++    immEnd();
++
++    immUnbindProgram();
++
++    GPU_line_smooth(false);
++    GPU_blend(GPU_BLEND_NONE);
++
++    /* Draw axis indicator at pivot position for cursor rotation mode.
++     * This shows the direction of axes after rotation, same as gizmo mode.
++     * Matrix is already translated to pivot position, so we draw from (0,0). */
++    {
++
++      /* Draw axis indicator at pivot position (matrix already at pivot). */
++      draw_axis_indicator(true, 1.0f);
++    }
++  }
++
++  GPU_matrix_pop();
++  GPU_matrix_pop_projection();
++}
++
++static void image_view_rotate_interactive_update_header(wmOperator *op, bContext *C)
++{
++  ImageRotateInteractiveData *data = static_cast<ImageRotateInteractiveData *>(op->customdata);
++  SpaceImage *sima = CTX_wm_space_image(C);
++  ScrArea *area = CTX_wm_area(C);
++
++  char msg[UI_MAX_DRAW_STR];
++  SNPRINTF(msg, "Rotation: %.1f°", RAD2DEGF(sima->rotation));
++  ED_area_status_text(area, msg);
++}
++
++static wmOperatorStatus image_view_rotate_interactive_invoke(bContext *C,
++                                                             wmOperator *op,
++                                                             const wmEvent *event)
++{
++  SpaceImage *sima = CTX_wm_space_image(C);
++  ARegion *region = CTX_wm_region(C);
++
++  if (sima == nullptr || region == nullptr) {
++
++    return OPERATOR_CANCELLED;
++  }
++
++  ImageRotateInteractiveData *data = MEM_new<ImageRotateInteractiveData>(__func__);
++  data->initial_rotation = sima->rotation;
++  data->init_event_type = event->type;
++
++  data->initial_offset[0] = sima->xof;
++  data->initial_offset[1] = sima->yof;
++
++  /* Check if we should use center pivot (from gizmo) or cursor pivot (from hotkey) */
++  data->use_center_pivot = RNA_boolean_get(op->ptr, "use_center_pivot");
++
++  if (data->use_center_pivot) {
++    /* Use center of image (0.5, 0.5) as rotation pivot for both initial and current.
++     * This ensures correct compensation when switching from cursor pivot (hotkey) to center pivot
++     * (gizmo). */
++    data->initial_pivot[0] = 0.5f;
++    data->initial_pivot[1] = 0.5f;
++    data->current_pivot[0] = 0.5f;
++    data->current_pivot[1] = 0.5f;
++  }
++  else {
++    /* Use current rotation_pivot from sima (may be from previous rotation). */
++    data->initial_pivot[0] = sima->rotation_pivot[0];
++    data->initial_pivot[1] = sima->rotation_pivot[1];
++    /* current_pivot will be set from mouse position below. */
++  }
++
++  if (data->use_center_pivot) {
++    if (sima->rotation != 0.0f) {
++      const float scale_x = 1.0f / BLI_rctf_size_x(&region->v2d.cur);
++      const float scale_y = 1.0f / BLI_rctf_size_y(&region->v2d.cur);
++
++      const float delta_p_ss_x = scale_x * (data->initial_pivot[0] - data->current_pivot[0]);
++      const float delta_p_ss_y = scale_y * (data->initial_pivot[1] - data->current_pivot[1]);
++
++      const float cos_r = cosf(sima->rotation);
++      const float sin_r = sinf(sima->rotation);
++      const float rotated_delta_p_ss_x = cos_r * delta_p_ss_x - sin_r * delta_p_ss_y;
++      const float rotated_delta_p_ss_y = sin_r * delta_p_ss_x + cos_r * delta_p_ss_y;
++
++      const float delta_translate_x = delta_p_ss_x - rotated_delta_p_ss_x;
++      const float delta_translate_y = delta_p_ss_y - rotated_delta_p_ss_y;
++
++      int width, height;
++      ED_space_image_get_size(sima, &width, &height);
++      float w = float(width);
++      float h = float(height);
++      if (Image *ima = ED_space_image(sima)) {
++
++        h *= ima->aspy / ima->aspx;
++      }
++      sima->xof += -(w / scale_x) * delta_translate_x;
++      sima->yof += -(h / scale_y) * delta_translate_y;
++    }
++
++    sima->rotation_pivot[0] = data->current_pivot[0];
++    sima->rotation_pivot[1] = data->current_pivot[1];
++
++    /* Calculate pivot screen position from image center (0.5, 0.5) in UV space.
++     * Convert UV to region coordinates. */
++    float pivot_uv[2] = {0.5f, 0.5f};
++    float pivot_region[2];
++    ED_image_point_pos__reverse_rotated(sima, region, pivot_uv, pivot_region);
++    data->pivot_screen[0] = float(region->winrct.xmin + int(pivot_region[0]));
++    data->pivot_screen[1] = float(region->winrct.ymin + int(pivot_region[1]));
++  }
++  else {
++    /* Use cursor position as rotation pivot (original behavior). */
++    ED_image_mouse_pos_rotated(sima, region, event->mval, data->current_pivot);
++
++    /* Snap pivot to center (0.5, 0.5) or corners (0,0), (1,0), (0,1), (1,1) if close enough.
++     * Uses screen-space distance for intuitive, zoom-independent snapping. */
++    {
++      /* Snap distance in pixels (tunable for user preference).
++       * 35px = comfortable distance for snapping, works well at any zoom level. */
++      const float SNAP_DISTANCE_PX = 35.0f;
++      const float CENTER_DISTANCE_PX = SNAP_DISTANCE_PX *
++                                       0.8f; /* 28px for center (easier to snap) */
++
++      /* Current cursor position in screen space (region coordinates) */
++      float cursor_pos[2] = {float(event->mval[0]), float(event->mval[1])};
++
++      float snap_pivot[2] = {data->current_pivot[0], data->current_pivot[1]};
++      bool snapped = false;
++      float min_dist = SNAP_DISTANCE_PX;
++
++      /* Helper lambda to convert UV coordinates to screen position using proper View2D transform
++       */
++      auto uv_to_screen = [&](float u, float v, float r_out[2]) {
++        float uv_pos[2] = {u, v};
++        ED_image_point_pos__reverse(sima, region, uv_pos, r_out);
++      };
++
++      /* Check center (0.5, 0.5) first - has larger threshold for easier access */
++      {
++        float center_screen[2];
++        uv_to_screen(0.5f, 0.5f, center_screen);
++        float dist_to_center = len_v2v2(center_screen, cursor_pos);
++
++        if (dist_to_center < CENTER_DISTANCE_PX) {
++          snap_pivot[0] = 0.5f;
++          snap_pivot[1] = 0.5f;
++          snapped = true;
++          min_dist = dist_to_center;
++        }
++      }
++
++      /* Check corners - only if not already snapped to center (or find closest) */
++      if (!snapped) {
++        struct {
++          float x, y;
++          const char *name;
++        } corners[] = {
++            {0.0f, 0.0f, "BOTTOM-LEFT"},
++            {1.0f, 0.0f, "BOTTOM-RIGHT"},
++            {0.0f, 1.0f, "TOP-LEFT"},
++            {1.0f, 1.0f, "TOP-RIGHT"},
++        };
++
++        for (const auto &corner : corners) {
++          float corner_screen[2];
++          uv_to_screen(corner.x, corner.y, corner_screen);
++          float dist = len_v2v2(corner_screen, cursor_pos);
++
++          if (dist < SNAP_DISTANCE_PX && dist < min_dist) {
++            snap_pivot[0] = corner.x;
++            snap_pivot[1] = corner.y;
++            snapped = true;
++            min_dist = dist;
++          }
++        }
++      }
++
++      if (snapped) {
++        data->current_pivot[0] = snap_pivot[0];
++        data->current_pivot[1] = snap_pivot[1];
++      }
++      else {
++      }
++    }
++
++    if (sima->rotation != 0.0f) {
++      const float scale_x = 1.0f / BLI_rctf_size_x(&region->v2d.cur);
++      const float scale_y = 1.0f / BLI_rctf_size_y(&region->v2d.cur);
++
++      const float delta_p_ss_x = scale_x * (data->initial_pivot[0] - data->current_pivot[0]);
++      const float delta_p_ss_y = scale_y * (data->initial_pivot[1] - data->current_pivot[1]);
++
++      const float cos_r = cosf(sima->rotation);
++      const float sin_r = sinf(sima->rotation);
++      const float rotated_delta_p_ss_x = cos_r * delta_p_ss_x - sin_r * delta_p_ss_y;
++      const float rotated_delta_p_ss_y = sin_r * delta_p_ss_x + cos_r * delta_p_ss_y;
++
++      const float delta_translate_x = delta_p_ss_x - rotated_delta_p_ss_x;
++      const float delta_translate_y = delta_p_ss_y - rotated_delta_p_ss_y;
++
++      int width, height;
++      ED_space_image_get_size(sima, &width, &height);
++      float w = float(width);
++      float h = float(height);
++      if (Image *ima = ED_space_image(sima)) {
++
++        h *= ima->aspy / ima->aspx;
++      }
++      sima->xof += -(w / scale_x) * delta_translate_x;
++      sima->yof += -(h / scale_y) * delta_translate_y;
++    }
++
++    sima->rotation_pivot[0] = data->current_pivot[0];
++    sima->rotation_pivot[1] = data->current_pivot[1];
++
++    /* Save pivot screen position for drawing.
++     * For cursor mode, the pivot indicator should be drawn at the original click position.
++     * We use event->mval directly because:
++     * 1. It's the correct visual position where user clicked
++     * 2. Converting UV→screen with rotation has complexity when snap changes the pivot
++     * 3. This ensures perfect 1:1 correspondence between click and indicator */
++    data->pivot_screen[0] = float(region->winrct.xmin + event->mval[0]);
++    data->pivot_screen[1] = float(region->winrct.ymin + event->mval[1]);
++  }
++
++  /* Initialize dial at cursor position (in screen/window coordinates) */
++  float cursor_screen[2];
++  cursor_screen[0] = float(event->xy[0]);
++  cursor_screen[1] = float(event->xy[1]);
++  data->dial = BLI_dial_init(cursor_screen, FLT_EPSILON);
++
++  /* Activate paint cursor to draw pivot point */
++  data->cursor = WM_paint_cursor_activate(
++      SPACE_IMAGE, RGN_TYPE_WINDOW, nullptr, image_rotate_draw_pivot, data);
++
++  /* Set modal cursor for rotation */
++  wmWindow *win = CTX_wm_window(C);
++  if (WM_cursor_modal_is_set_ok(win)) {
++    WM_cursor_modal_set(win, WM_CURSOR_NSEW_SCROLL);
++  }
++
++  op->customdata = data;
++
++  image_view_rotate_interactive_update_header(op, C);
++
++  WM_event_add_modal_handler(C, op);
++  return OPERATOR_RUNNING_MODAL;
++}
++
++static wmOperatorStatus image_view_rotate_interactive_modal(bContext *C,
++                                                            wmOperator *op,
++                                                            const wmEvent *event)
++{
++  ImageRotateInteractiveData *data = static_cast<ImageRotateInteractiveData *>(op->customdata);
++  SpaceImage *sima = CTX_wm_space_image(C);
++  ARegion *region = CTX_wm_region(C);
++
++  switch (event->type) {
++    case MOUSEMOVE: {
++      float current_position[2] = {float(event->xy[0]), float(event->xy[1])};
++      float angle = BLI_dial_angle(data->dial, current_position);
++
++      /* Calculate target rotation */
++      float target_rotation = data->initial_rotation + angle;
++
++      /* Apply 15° snapping with Ctrl - snap to absolute angles (0°, 15°, 30°, etc.) */
++      if (event->modifier & KM_CTRL) {
++        float snap_angle = DEG2RADF(15.0f);
++        target_rotation = roundf(target_rotation / snap_angle) * snap_angle;
++      }
++
++      /* Set rotation */
++      sima->rotation = target_rotation;
++      normalize_rotation_angle(sima->rotation);
++      ED_space_image_rotation_cache_update(sima);
++
++      image_view_rotate_interactive_update_header(op, C);
++      ED_region_tag_redraw(region);
++      break;
++    }
++    default:
++      break;
++  }
++
++  /* Handle confirm/cancel outside switch to catch multiple event types */
++  if (event->type == data->init_event_type && event->val == KM_RELEASE) {
++    /* Confirm on release of the button that started the operator */
++    WM_cursor_modal_restore(CTX_wm_window(C));
++    ED_area_status_text(CTX_wm_area(C), nullptr);
++    if (data->cursor) {
++      WM_paint_cursor_end(data->cursor);
++    }
++    if (data->dial) {
++      BLI_dial_free(data->dial);
++    }
++    MEM_delete(data);
++    op->customdata = nullptr;
++    return OPERATOR_FINISHED;
++  }
++  if (event->type == RIGHTMOUSE && event->val == KM_PRESS) {
++    /* Cancel with RMB - restore rotation AND pivot */
++    sima->rotation = data->initial_rotation;
++    ED_space_image_rotation_cache_update(sima);
++    sima->rotation_pivot[0] = data->initial_pivot[0];
++    sima->rotation_pivot[1] = data->initial_pivot[1];
++    sima->xof = data->initial_offset[0];
++    sima->yof = data->initial_offset[1];
++    ED_region_tag_redraw(region);
++    WM_cursor_modal_restore(CTX_wm_window(C));
++    ED_area_status_text(CTX_wm_area(C), nullptr);
++    if (data->cursor) {
++      WM_paint_cursor_end(data->cursor);
++    }
++    if (data->dial) {
++      BLI_dial_free(data->dial);
++    }
++    MEM_delete(data);
++    op->customdata = nullptr;
++    return OPERATOR_CANCELLED;
++  }
++  if (event->type == EVT_ESCKEY && event->val == KM_PRESS) {
++    /* Cancel with Escape - restore rotation AND pivot */
++    sima->rotation = data->initial_rotation;
++    ED_space_image_rotation_cache_update(sima);
++    sima->rotation_pivot[0] = data->initial_pivot[0];
++    sima->rotation_pivot[1] = data->initial_pivot[1];
++    sima->xof = data->initial_offset[0];
++    sima->yof = data->initial_offset[1];
++    ED_region_tag_redraw(region);
++    WM_cursor_modal_restore(CTX_wm_window(C));
++    ED_area_status_text(CTX_wm_area(C), nullptr);
++    if (data->cursor) {
++      WM_paint_cursor_end(data->cursor);
++    }
++    if (data->dial) {
++      BLI_dial_free(data->dial);
++    }
++    MEM_delete(data);
++    op->customdata = nullptr;
++    return OPERATOR_CANCELLED;
++  }
++
++  return OPERATOR_RUNNING_MODAL;
++}
++
++static void image_view_rotate_interactive_cancel(bContext *C, wmOperator *op)
++{
++  ImageRotateInteractiveData *data = static_cast<ImageRotateInteractiveData *>(op->customdata);
++
++  if (data) {
++    SpaceImage *sima = CTX_wm_space_image(C);
++    /* Restore both rotation and pivot */
++    sima->rotation = data->initial_rotation;
++    ED_space_image_rotation_cache_update(sima);
++    sima->rotation_pivot[0] = data->initial_pivot[0];
++    sima->rotation_pivot[1] = data->initial_pivot[1];
++    sima->xof = data->initial_offset[0];
++    sima->yof = data->initial_offset[1];
++
++    WM_cursor_modal_restore(CTX_wm_window(C));
++
++    if (data->cursor) {
++      WM_paint_cursor_end(data->cursor);
++    }
++    if (data->dial) {
++      BLI_dial_free(data->dial);
++    }
++    MEM_delete(data);
++    op->customdata = nullptr;
++  }
++
++  ED_area_status_text(CTX_wm_area(C), nullptr);
++}
++
++void IMAGE_OT_view_rotate_interactive(wmOperatorType *ot)
++{
++  ot->name = "Rotate View Interactive";
++  ot->idname = "IMAGE_OT_view_rotate_interactive";
++  ot->description = "Rotate the canvas";
++
++  ot->invoke = image_view_rotate_interactive_invoke;
++  ot->modal = image_view_rotate_interactive_modal;
++  ot->cancel = image_view_rotate_interactive_cancel;
++  ot->poll = space_image_rotation_poll;
++
++  ot->flag = OPTYPE_BLOCKING | OPTYPE_GRAB_CURSOR_XY;
++
++  PropertyRNA *prop;
++  prop = RNA_def_boolean(ot->srna,
++                         "use_center_pivot",
++                         false,
++                         "Use Center Pivot",
++                         "Rotate around the center of the image instead of the cursor position");
++  RNA_def_property_flag(prop, PROP_SKIP_SAVE);
++}
++
++/** \} */
++
+ /* load/replace/save callbacks */
+ static void image_filesel(bContext *C, wmOperator *op, const char *path)
+ {
+@@ -3629,7 +4607,8 @@ bool ED_space_image_get_position(SpaceImage *sima,
+     return false;
+   }
+ 
+-  ui::view2d_region_to_view(&region->v2d, mval[0], mval[1], &r_fpos[0], &r_fpos[1]);
++  /* Use rotated version to compensate for canvas rotation */
++  ED_image_mouse_pos_rotated(sima, region, mval, r_fpos);
+ 
+   ED_space_image_release_buffer(sima, ibuf, lock);
+   return true;
+@@ -3645,7 +4624,8 @@ bool ED_space_image_color_sample(
+     return false;
+   }
+   float uv[2];
+-  ui::view2d_region_to_view(&region->v2d, mval[0], mval[1], &uv[0], &uv[1]);
++  /* Use rotated version to compensate for canvas rotation */
++  ED_image_mouse_pos_rotated(sima, region, mval, uv);
+   int tile = BKE_image_get_tile_from_pos(sima->image, uv, uv, nullptr);
+ 
+   void *lock;
+@@ -3727,8 +4707,11 @@ static wmOperatorStatus image_sample_line_exec(bContext *C, wmOperator *op)
+   int y_end = RNA_int_get(op->ptr, "yend");
+ 
+   float uv1[2], uv2[2], ofs[2];
+-  ui::view2d_region_to_view(&region->v2d, x_start, y_start, &uv1[0], &uv1[1]);
+-  ui::view2d_region_to_view(&region->v2d, x_end, y_end, &uv2[0], &uv2[1]);
++  /* Use rotation-compensated coordinates for correct sample line when canvas is rotated. */
++  int mval_start[2] = {x_start, y_start};
++  int mval_end[2] = {x_end, y_end};
++  ED_image_mouse_pos_rotated(sima, region, mval_start, uv1);
++  ED_image_mouse_pos_rotated(sima, region, mval_end, uv2);
+ 
+   /* If the image has tiles, shift the positions accordingly. */
+   int tile = BKE_image_get_tile_from_pos(ima, uv1, uv1, ofs);
+@@ -4173,10 +5156,37 @@ static wmOperatorStatus render_border_exec(bContext *C, wmOperator *op)
+   const RenderData *rd = ED_space_image_has_buffer(sima) ? RE_engine_get_render_data(re) :
+                                                            &scene->r;
+ 
+-  /* Get rectangle from the operator. */
++  /* Get rectangle from the operator and apply rotation compensation. */
+   rctf border;
+   WM_operator_properties_border_to_rctf(op, &border);
+-  ui::view2d_region_to_view_rctf(&region->v2d, &border, &border);
++
++  if (sima && sima->rotation != 0.0f) {
++    int corners[4][2] = {
++        {int(border.xmin), int(border.ymin)},
++        {int(border.xmax), int(border.ymin)},
++        {int(border.xmax), int(border.ymax)},
++        {int(border.xmin), int(border.ymax)},
++    };
++    float uv_corners[4][2];
++    float uv_min[2] = {FLT_MAX, FLT_MAX};
++    float uv_max[2] = {-FLT_MAX, -FLT_MAX};
++
++    for (int i = 0; i < 4; i++) {
++      ED_image_mouse_pos_rotated(sima, region, corners[i], uv_corners[i]);
++      uv_min[0] = std::min(uv_min[0], uv_corners[i][0]);
++      uv_min[1] = std::min(uv_min[1], uv_corners[i][1]);
++      uv_max[0] = std::max(uv_max[0], uv_corners[i][0]);
++      uv_max[1] = std::max(uv_max[1], uv_corners[i][1]);
++    }
++
++    border.xmin = uv_min[0];
++    border.ymin = uv_min[1];
++    border.xmax = uv_max[0];
++    border.ymax = uv_max[1];
++  }
++  else {
++    ui::view2d_region_to_view_rctf(&region->v2d, &border, &border);
++  }
+ 
+   /* Adjust for cropping. */
+   if ((rd->mode & (R_BORDER | R_CROP)) == (R_BORDER | R_CROP)) {
+diff --git a/source/blender/editors/space_image/space_image.cc b/source/blender/editors/space_image/space_image.cc
+index 3a2986c4ef0..9cc7204c7d8 100644
+--- a/source/blender/editors/space_image/space_image.cc
++++ b/source/blender/editors/space_image/space_image.cc
+@@ -35,6 +35,7 @@
+ #include "IMB_imbuf_types.hh"
+ 
+ #include "ED_asset_shelf.hh"
++#include "ED_gizmo_utils.hh"
+ #include "ED_image.hh"
+ #include "ED_mask.hh"
+ #include "ED_node.hh"
+@@ -225,6 +226,10 @@ static void image_operatortypes()
+   WM_operatortype_append(IMAGE_OT_view_zoom_out);
+   WM_operatortype_append(IMAGE_OT_view_zoom_ratio);
+   WM_operatortype_append(IMAGE_OT_view_zoom_border);
++  WM_operatortype_append(IMAGE_OT_view_rotate_cw);
++  WM_operatortype_append(IMAGE_OT_view_rotate_ccw);
++  WM_operatortype_append(IMAGE_OT_view_rotate_reset);
++  WM_operatortype_append(IMAGE_OT_view_rotate_interactive);
+ #ifdef WITH_INPUT_NDOF
+   WM_operatortype_append(IMAGE_OT_view_ndof);
+ #endif
+diff --git a/source/blender/editors/transform/transform.cc b/source/blender/editors/transform/transform.cc
+index c5569f1a583..03c8486c0b2 100644
+--- a/source/blender/editors/transform/transform.cc
++++ b/source/blender/editors/transform/transform.cc
+@@ -157,6 +157,37 @@ static void convertViewVec2D(View2D *v2d, float r_vec[3], int dx, int dy)
+   r_vec[2] = 0.0f;
+ }
+ 
++/**
++ * Convert screen delta to view delta with rotation compensation.
++ *
++ * The GPU view matrix applies rotation R(+θ) when rendering UV to screen.
++ * When the user moves the mouse in screen space, we need to apply the
++ * INVERSE rotation R(-θ) to get the correct UV-space delta.
++ *
++ * Formula: UV_delta = R(-θ) * screen_delta
++ *
++ * Uses pre-cached sin/cos values for performance.
++ * For inverse rotation: cos(-θ) = cos(θ), sin(-θ) = -sin(θ)
++ */
++static void convertViewVec2D_rotated(
++    View2D *v2d, float r_vec[3], int dx, int dy, float rotation_cos, float rotation_sin)
++{
++  /* First convert to view space without rotation. */
++  convertViewVec2D(v2d, r_vec, dx, dy);
++
++  if (rotation_sin != 0.0f) {
++    /* Apply INVERSE rotation to the delta vector using cached values.
++     * cos(-θ) = cos(θ), sin(-θ) = -sin(θ) */
++    float cos_r = rotation_cos;
++    float sin_r = -rotation_sin;
++    float x = r_vec[0];
++    float y = r_vec[1];
++
++    r_vec[0] = x * cos_r - y * sin_r;
++    r_vec[1] = x * sin_r + y * cos_r;
++  }
++}
++
+ static void convertViewVec2D_mask(View2D *v2d, float r_vec[3], int dx, int dy)
+ {
+   float divx = BLI_rcti_size_x(&v2d->mask);
+@@ -195,6 +226,8 @@ void convertViewVec(TransInfo *t, float r_vec[3], double dx, double dy)
+     }
+   }
+   else if (t->spacetype == SPACE_IMAGE) {
++    SpaceImage *sima = static_cast<SpaceImage *>(t->area->spacedata.first);
++
+     if (t->options & CTX_MASK) {
+       convertViewVec2D_mask(static_cast<View2D *>(t->view), r_vec, dx, dy);
+     }
+@@ -203,7 +236,11 @@ void convertViewVec(TransInfo *t, float r_vec[3], double dx, double dy)
+       r_vec[1] = dy;
+     }
+     else {
+-      convertViewVec2D(static_cast<View2D *>(t->view), r_vec, dx, dy);
++      /* Use rotation-compensated conversion for UV editing. */
++      float rotation_cos = sima ? sima->rotation_cos : 1.0f;
++      float rotation_sin = sima ? sima->rotation_sin : 0.0f;
++      convertViewVec2D_rotated(
++          static_cast<View2D *>(t->view), r_vec, dx, dy, rotation_cos, rotation_sin);
+     }
+ 
+     r_vec[0] *= t->aspect[0];
+@@ -227,7 +264,6 @@ void convertViewVec(TransInfo *t, float r_vec[3], double dx, double dy)
+     r_vec[1] *= t->aspect[1];
+   }
+   else {
+-    printf("%s: called in an invalid context\n", __func__);
+     zero_v3(r_vec);
+   }
+ }
+@@ -314,13 +350,16 @@ void projectIntViewEx(TransInfo *t, const float vec[3], int adr[2], const eV3DPr
+       adr[1] = vec[1];
+     }
+     else {
++      /* Regular UV editing - use rotation-compensated projection. */
+       float v[2];
+ 
+       v[0] = vec[0] / t->aspect[0];
+       v[1] = vec[1] / t->aspect[1];
+ 
+-      ui::view2d_view_to_region(
+-          static_cast<const View2D *>(t->view), v[0], v[1], &adr[0], &adr[1]);
++      ED_image_point_pos__reverse_rotated(sima, t->region, v, v);
++
++      adr[0] = v[0];
++      adr[1] = v[1];
+     }
+   }
+   else if (t->spacetype == SPACE_ACTION) {
+diff --git a/source/blender/editors/transform/transform_convert_cursor.cc b/source/blender/editors/transform/transform_convert_cursor.cc
+index d900d9f4c3e..5c078aeb09f 100644
+--- a/source/blender/editors/transform/transform_convert_cursor.cc
++++ b/source/blender/editors/transform/transform_convert_cursor.cc
+@@ -33,6 +33,11 @@ static void createTransCursor_2D_impl(TransInfo *t, float cursor_location[2])
+ {
+   TransData *td;
+   TransData2D *td2d;
++
++  if (t->spacetype == SPACE_IMAGE) {
++    SpaceImage *sima = static_cast<SpaceImage *>(t->area->spacedata.first);
++  }
++
+   {
+     BLI_assert(t->data_container_len == 1);
+     TransDataContainer *tc = t->data_container;
+diff --git a/source/blender/editors/transform/transform_generics.cc b/source/blender/editors/transform/transform_generics.cc
+index cb5140a8912..e9ce234ca13 100644
+--- a/source/blender/editors/transform/transform_generics.cc
++++ b/source/blender/editors/transform/transform_generics.cc
+@@ -920,6 +920,7 @@ void restoreTransObjects(TransInfo *t)
+ void calculateCenter2D(TransInfo *t)
+ {
+   BLI_assert(!is_zero_v3(t->aspect));
++
+   projectFloatView(t, t->center_global, t->center2d);
+ }
+ 
+@@ -958,9 +959,13 @@ void calculateCenterCursor2D(TransInfo *t, float r_center[2])
+   float cursor_local_buf[2];
+   const float *cursor = nullptr;
+ 
++  printf("\n=== calculateCenterCursor2D ===\n");
++
+   if (t->spacetype == SPACE_IMAGE) {
+     SpaceImage *sima = static_cast<SpaceImage *>(t->area->spacedata.first);
+     cursor = sima->cursor;
++    printf("  SPACE_IMAGE cursor: [%.4f, %.4f]\n", cursor[0], cursor[1]);
++    printf("  sima->rotation: %.4f rad (%.1f deg)\n", sima->rotation, RAD2DEGF(sima->rotation));
+   }
+   if (t->spacetype == SPACE_SEQ) {
+     SpaceSeq *sseq = static_cast<SpaceSeq *>(t->area->spacedata.first);
+@@ -973,6 +978,12 @@ void calculateCenterCursor2D(TransInfo *t, float r_center[2])
+     cursor = space_clip->cursor;
+   }
+ 
++  printf("  options: CTX_CURSOR=%d, CTX_MASK=%d, CTX_PAINT_CURVE=%d\n",
++         (t->options & CTX_CURSOR) ? 1 : 0,
++         (t->options & CTX_MASK) ? 1 : 0,
++         (t->options & CTX_PAINT_CURVE) ? 1 : 0);
++  printf("  t->aspect: [%.4f, %.4f]\n", t->aspect[0], t->aspect[1]);
++
+   if (cursor) {
+     if (t->options & CTX_MASK) {
+       float co[2];
+@@ -999,9 +1010,12 @@ void calculateCenterCursor2D(TransInfo *t, float r_center[2])
+       }
+     }
+     else {
++      printf("  Using default path (cursor * aspect)\n");
+       r_center[0] = cursor[0] * t->aspect[0];
+       r_center[1] = cursor[1] * t->aspect[1];
+     }
++
++    printf("  r_center result: [%.4f, %.4f]\n", r_center[0], r_center[1]);
+   }
+ }
+ 
+diff --git a/source/blender/editors/transform/transform_gizmo_2d.cc b/source/blender/editors/transform/transform_gizmo_2d.cc
+index 47b9e575767..1cabc2d4ddf 100644
+--- a/source/blender/editors/transform/transform_gizmo_2d.cc
++++ b/source/blender/editors/transform/transform_gizmo_2d.cc
+@@ -436,9 +436,23 @@ static bool gizmo2d_calc_transform_pivot(const bContext *C,
+ 
+ /**
+  * Convert origin (or any other point) from view to region space.
++ * Accounts for canvas rotation in SPACE_IMAGE.
+  */
+-BLI_INLINE void gizmo2d_origin_to_region(ARegion *region, float *r_origin)
++BLI_INLINE void gizmo2d_origin_to_region(const bContext *C, ARegion *region, float *r_origin)
+ {
++  ScrArea *area = CTX_wm_area(C);
++  if (area && area->spacetype == SPACE_IMAGE) {
++    const SpaceImage *sima = static_cast<const SpaceImage *>(area->spacedata.first);
++    if (sima->rotation != 0.0f) {
++      /* Use rotation-compensated projection for Image Editor with canvas rotation. */
++      float screen_pos[2];
++      ED_image_view_to_region_rotated(sima, region, r_origin, screen_pos);
++      r_origin[0] = screen_pos[0];
++      r_origin[1] = screen_pos[1];
++      return;
++    }
++  }
++  /* Default: no rotation, use standard View2D conversion. */
+   ui::view2d_view_to_region_fl(&region->v2d, r_origin[0], r_origin[1], &r_origin[0], &r_origin[1]);
+ }
+ 
+@@ -454,7 +468,7 @@ static wmOperatorStatus gizmo2d_modal(bContext *C,
+   float origin[3];
+ 
+   gizmo2d_calc_transform_pivot(C, false, origin);
+-  gizmo2d_origin_to_region(region, origin);
++  gizmo2d_origin_to_region(C, region, origin);
+   WM_gizmo_set_matrix_location(widget, origin);
+ 
+   ED_region_tag_redraw_editor_overlays(region);
+@@ -625,7 +639,7 @@ static void gizmo2d_xform_draw_prepare(const bContext *C, wmGizmoGroup *gzgroup)
+   GizmoGroup2D *ggd = static_cast<GizmoGroup2D *>(gzgroup->customdata);
+   float origin[3] = {UNPACK2(ggd->origin), 0.0f};
+ 
+-  gizmo2d_origin_to_region(region, origin);
++  gizmo2d_origin_to_region(C, region, origin);
+ 
+   for (int i = 0; i < ARRAY_SIZE(ggd->translate_xy); i++) {
+     wmGizmo *gz = ggd->translate_xy[i];
+@@ -662,6 +676,29 @@ static void gizmo2d_xform_draw_prepare(const bContext *C, wmGizmoGroup *gzgroup)
+   else {
+     const float origin_aa[3] = {UNPACK2(ggd->origin), 0.0f};
+     WM_gizmo_set_matrix_offset_location(ggd->cage, origin_aa);
++
++    /* Apply canvas rotation for SPACE_IMAGE. */
++    if (area->spacetype == SPACE_IMAGE) {
++      const SpaceImage *sima = static_cast<const SpaceImage *>(area->spacedata.first);
++      if (sima->rotation != 0.0f) {
++        /* Get pivot in screen coordinates for rotation center. */
++        float pivot_screen[2];
++        ED_image_view_to_region_rotated(sima, region, sima->rotation_pivot, pivot_screen);
++
++        float matrix_rotate[4][4];
++        unit_m4(matrix_rotate);
++        copy_v3_v3(matrix_rotate[3], pivot_screen);
++        rotate_m4(matrix_rotate, 'Z', sima->rotation);
++        unit_m4(ggd->cage->matrix_basis);
++        mul_m4_m4m4(ggd->cage->matrix_basis, matrix_rotate, ggd->cage->matrix_basis);
++
++        /* Adjust offset to compensate for pivot. */
++        float mid[2];
++        sub_v2_v2v2(mid, pivot_screen, origin);
++        mul_v2_fl(mid, -1.0f);
++        copy_v2_v2(ggd->cage->matrix_offset[3], mid);
++      }
++    }
+   }
+ }
+ 
+@@ -853,7 +890,7 @@ static void gizmo2d_resize_draw_prepare(const bContext *C, wmGizmoGroup *gzgroup
+   GizmoGroup_Resize2D *ggd = static_cast<GizmoGroup_Resize2D *>(gzgroup->customdata);
+   float origin[3] = {UNPACK2(ggd->origin), 0.0f};
+ 
+-  gizmo2d_origin_to_region(region, origin);
++  gizmo2d_origin_to_region(C, region, origin);
+ 
+   for (int i = 0; i < ARRAY_SIZE(ggd->gizmo_xy); i++) {
+     wmGizmo *gz = ggd->gizmo_xy[i];
+@@ -1008,7 +1045,7 @@ static void gizmo2d_rotate_draw_prepare(const bContext *C, wmGizmoGroup *gzgroup
+   GizmoGroup_Rotate2D *ggd = static_cast<GizmoGroup_Rotate2D *>(gzgroup->customdata);
+   float origin[3] = {UNPACK2(ggd->origin), 0.0f};
+ 
+-  gizmo2d_origin_to_region(region, origin);
++  gizmo2d_origin_to_region(C, region, origin);
+ 
+   wmGizmo *gz = ggd->gizmo;
+   WM_gizmo_set_matrix_location(gz, origin);
+diff --git a/source/blender/editors/uvedit/uvedit_ops.cc b/source/blender/editors/uvedit/uvedit_ops.cc
+index 9f37244f18f..a12386dc496 100644
+--- a/source/blender/editors/uvedit/uvedit_ops.cc
++++ b/source/blender/editors/uvedit/uvedit_ops.cc
+@@ -2269,17 +2269,17 @@ static wmOperatorStatus uv_set_2d_cursor_exec(bContext *C, wmOperator *op)
+ static wmOperatorStatus uv_set_2d_cursor_invoke(bContext *C, wmOperator *op, const wmEvent *event)
+ {
+   ARegion *region = CTX_wm_region(C);
++  SpaceImage *sima = CTX_wm_space_image(C);
+   float location[2];
+ 
+   if (region->regiontype == RGN_TYPE_WINDOW) {
+-    SpaceImage *sima = CTX_wm_space_image(C);
+     if (sima && ED_space_image_show_cache_and_mval_over(sima, region, event->mval)) {
+       return OPERATOR_PASS_THROUGH;
+     }
+   }
+ 
+-  ui::view2d_region_to_view(
+-      &region->v2d, event->mval[0], event->mval[1], &location[0], &location[1]);
++  /* Use rotation-compensated coordinates for correct cursor position when canvas is rotated. */
++  ED_image_mouse_pos_rotated(sima, region, event->mval, location);
+   RNA_float_set_array(op->ptr, "location", location);
+ 
+   return uv_set_2d_cursor_exec(C, op);
+diff --git a/source/blender/editors/uvedit/uvedit_path.cc b/source/blender/editors/uvedit/uvedit_path.cc
+index 1c1a566d508..cfb07123dca 100644
+--- a/source/blender/editors/uvedit/uvedit_path.cc
++++ b/source/blender/editors/uvedit/uvedit_path.cc
+@@ -32,6 +32,7 @@
+ #include "DEG_depsgraph.hh"
+ #include "DEG_depsgraph_query.hh"
+ 
++#include "ED_image.hh"
+ #include "ED_object.hh"
+ #include "ED_screen.hh"
+ #include "ED_uvedit.hh"
+@@ -583,8 +584,10 @@ static wmOperatorStatus uv_shortest_path_pick_invoke(bContext *C,
+   float co[2];
+ 
+   const ARegion *region = CTX_wm_region(C);
++  SpaceImage *sima = CTX_wm_space_image(C);
+ 
+-  ui::view2d_region_to_view(&region->v2d, event->mval[0], event->mval[1], &co[0], &co[1]);
++  /* Use rotation-compensated coordinates for correct path selection when canvas is rotated. */
++  ED_image_mouse_pos_rotated(sima, region, event->mval, co);
+ 
+   BMElem *ele_src = nullptr, *ele_dst = nullptr;
+ 
+diff --git a/source/blender/editors/uvedit/uvedit_rip.cc b/source/blender/editors/uvedit/uvedit_rip.cc
+index 96225d7def9..45aa3c5f9e2 100644
+--- a/source/blender/editors/uvedit/uvedit_rip.cc
++++ b/source/blender/editors/uvedit/uvedit_rip.cc
+@@ -31,6 +31,7 @@
+ 
+ #include "DEG_depsgraph.hh"
+ 
++#include "ED_image.hh"
+ #include "ED_mesh.hh"
+ #include "ED_screen.hh"
+ #include "ED_transform.hh"
+@@ -966,9 +967,11 @@ static wmOperatorStatus uv_rip_exec(bContext *C, wmOperator *op)
+ static wmOperatorStatus uv_rip_invoke(bContext *C, wmOperator *op, const wmEvent *event)
+ {
+   ARegion *region = CTX_wm_region(C);
++  SpaceImage *sima = CTX_wm_space_image(C);
+   float co[2];
+ 
+-  ui::view2d_region_to_view(&region->v2d, event->mval[0], event->mval[1], &co[0], &co[1]);
++  /* Use rotation-compensated coordinates for correct rip position when canvas is rotated. */
++  ED_image_mouse_pos_rotated(sima, region, event->mval, co);
+   RNA_float_set_array(op->ptr, "location", co);
+ 
+   return uv_rip_exec(C, op);
+diff --git a/source/blender/editors/uvedit/uvedit_select.cc b/source/blender/editors/uvedit/uvedit_select.cc
+index 02cd4a1b823..4f1853e8711 100644
+--- a/source/blender/editors/uvedit/uvedit_select.cc
++++ b/source/blender/editors/uvedit/uvedit_select.cc
+@@ -6,6 +6,7 @@
+  * \ingroup eduv
+  */
+ 
++#include <algorithm>
+ #include <cmath>
+ #include <cstdlib>
+ #include <cstring>
+@@ -3907,9 +3908,11 @@ static wmOperatorStatus uv_select_exec(bContext *C, wmOperator *op)
+ static wmOperatorStatus uv_select_invoke(bContext *C, wmOperator *op, const wmEvent *event)
+ {
+   const ARegion *region = CTX_wm_region(C);
++  SpaceImage *sima = CTX_wm_space_image(C);
+   float co[2];
+ 
+-  ui::view2d_region_to_view(&region->v2d, event->mval[0], event->mval[1], &co[0], &co[1]);
++  /* Use rotation-compensated coordinates for correct selection when canvas is rotated. */
++  ED_image_mouse_pos_rotated(sima, region, event->mval, co);
+   RNA_float_set_array(op->ptr, "location", co);
+ 
+   const wmOperatorStatus retval = uv_select_exec(C, op);
+@@ -4060,9 +4063,11 @@ static wmOperatorStatus uv_select_loop_exec(bContext *C, wmOperator *op)
+ static wmOperatorStatus uv_select_loop_invoke(bContext *C, wmOperator *op, const wmEvent *event)
+ {
+   const ARegion *region = CTX_wm_region(C);
++  SpaceImage *sima = CTX_wm_space_image(C);
+   float co[2];
+ 
+-  ui::view2d_region_to_view(&region->v2d, event->mval[0], event->mval[1], &co[0], &co[1]);
++  /* Use rotation-compensated coordinates for correct selection when canvas is rotated. */
++  ED_image_mouse_pos_rotated(sima, region, event->mval, co);
+   RNA_float_set_array(op->ptr, "location", co);
+ 
+   const wmOperatorStatus retval = uv_select_loop_exec(C, op);
+@@ -4124,9 +4129,11 @@ static wmOperatorStatus uv_select_edge_ring_invoke(bContext *C,
+                                                    const wmEvent *event)
+ {
+   const ARegion *region = CTX_wm_region(C);
++  SpaceImage *sima = CTX_wm_space_image(C);
+   float co[2];
+ 
+-  ui::view2d_region_to_view(&region->v2d, event->mval[0], event->mval[1], &co[0], &co[1]);
++  /* Use rotation-compensated coordinates for correct selection when canvas is rotated. */
++  ED_image_mouse_pos_rotated(sima, region, event->mval, co);
+   RNA_float_set_array(op->ptr, "location", co);
+ 
+   const wmOperatorStatus retval = uv_select_edge_ring_exec(C, op);
+@@ -4181,6 +4188,7 @@ static wmOperatorStatus uv_select_linked_internal(bContext *C,
+                                                   bool pick)
+ {
+   const ARegion *region = CTX_wm_region(C);
++  SpaceImage *sima = CTX_wm_space_image(C);
+   Scene *scene = CTX_data_scene(C);
+   const ToolSettings *ts = scene->toolsettings;
+   ViewLayer *view_layer = CTX_data_view_layer(C);
+@@ -4204,8 +4212,9 @@ static wmOperatorStatus uv_select_linked_internal(bContext *C,
+     float co[2];
+ 
+     if (event) {
+-      /* invoke */
+-      ui::view2d_region_to_view(&region->v2d, event->mval[0], event->mval[1], &co[0], &co[1]);
++      /* invoke - use rotation-compensated coordinates for correct selection when canvas is
++       * rotated. */
++      ED_image_mouse_pos_rotated(sima, region, event->mval, co);
+       RNA_float_set_array(op->ptr, "location", co);
+     }
+     else {
+@@ -4894,15 +4903,46 @@ static wmOperatorStatus uv_box_select_exec(bContext *C, wmOperator *op)
+   Depsgraph *depsgraph = CTX_data_ensure_evaluated_depsgraph(C);
+   ViewLayer *view_layer = CTX_data_view_layer(C);
+   const ARegion *region = CTX_wm_region(C);
++  SpaceImage *sima = CTX_wm_space_image(C);
+   BMFace *efa;
+   BMLoop *l;
+   BMIter iter, liter;
+   float *luv;
+   rctf rectf;
+ 
+-  /* get rectangle from operator */
++  /* Get rectangle from operator and apply rotation compensation.
++   * When canvas is rotated, the screen-space box becomes a rotated quadrilateral in UV space.
++   * We transform all 4 corners and create a bounding box for selection. */
+   WM_operator_properties_border_to_rctf(op, &rectf);
+-  ui::view2d_region_to_view_rctf(&region->v2d, &rectf, &rectf);
++
++  if (sima && sima->rotation != 0.0f) {
++    /* Transform all 4 corners with rotation compensation. */
++    int corners[4][2] = {
++        {int(rectf.xmin), int(rectf.ymin)},
++        {int(rectf.xmax), int(rectf.ymin)},
++        {int(rectf.xmax), int(rectf.ymax)},
++        {int(rectf.xmin), int(rectf.ymax)},
++    };
++    float uv_corners[4][2];
++    float uv_min[2] = {FLT_MAX, FLT_MAX};
++    float uv_max[2] = {-FLT_MAX, -FLT_MAX};
++
++    for (int i = 0; i < 4; i++) {
++      ED_image_mouse_pos_rotated(sima, region, corners[i], uv_corners[i]);
++      uv_min[0] = std::min(uv_min[0], uv_corners[i][0]);
++      uv_min[1] = std::min(uv_min[1], uv_corners[i][1]);
++      uv_max[0] = std::max(uv_max[0], uv_corners[i][0]);
++      uv_max[1] = std::max(uv_max[1], uv_corners[i][1]);
++    }
++
++    rectf.xmin = uv_min[0];
++    rectf.ymin = uv_min[1];
++    rectf.xmax = uv_max[0];
++    rectf.ymax = uv_max[1];
++  }
++  else {
++    ui::view2d_region_to_view_rctf(&region->v2d, &rectf, &rectf);
++  }
+ 
+   const eSelectOp sel_op = eSelectOp(RNA_enum_get(op->ptr, "mode"));
+   const bool select = (sel_op != SEL_OP_SUB);
+@@ -5187,7 +5227,9 @@ static wmOperatorStatus uv_circle_select_exec(bContext *C, wmOperator *op)
+   ellipse[0] = width * zoomx / radius;
+   ellipse[1] = height * zoomy / radius;
+ 
+-  ui::view2d_region_to_view(&region->v2d, x, y, &offset[0], &offset[1]);
++  /* Use rotation-compensated coordinates for correct selection when canvas is rotated. */
++  int mval[2] = {x, y};
++  ED_image_mouse_pos_rotated(sima, region, mval, offset);
+ 
+   bool changed_multi = false;
+ 
+@@ -7355,11 +7397,42 @@ void UV_OT_select_tile(wmOperatorType *ot)
+ static wmOperatorStatus uv_custom_region_set_exec(bContext *C, wmOperator *op)
+ {
+   const Scene *scene = CTX_data_scene(C);
++  SpaceImage *sima = CTX_wm_space_image(C);
+   const ARegion *region = CTX_wm_region(C);
+   ToolSettings *ts = scene->toolsettings;
+ 
+   WM_operator_properties_border_to_rctf(op, &ts->uv_custom_region);
+-  ui::view2d_region_to_view_rctf(&region->v2d, &ts->uv_custom_region, &ts->uv_custom_region);
++
++  /* Apply rotation compensation for custom region. */
++  if (sima && sima->rotation != 0.0f) {
++    rctf &rectf = ts->uv_custom_region;
++    int corners[4][2] = {
++        {int(rectf.xmin), int(rectf.ymin)},
++        {int(rectf.xmax), int(rectf.ymin)},
++        {int(rectf.xmax), int(rectf.ymax)},
++        {int(rectf.xmin), int(rectf.ymax)},
++    };
++    float uv_corners[4][2];
++    float uv_min[2] = {FLT_MAX, FLT_MAX};
++    float uv_max[2] = {-FLT_MAX, -FLT_MAX};
++
++    for (int i = 0; i < 4; i++) {
++      ED_image_mouse_pos_rotated(sima, region, corners[i], uv_corners[i]);
++      uv_min[0] = std::min(uv_min[0], uv_corners[i][0]);
++      uv_min[1] = std::min(uv_min[1], uv_corners[i][1]);
++      uv_max[0] = std::max(uv_max[0], uv_corners[i][0]);
++      uv_max[1] = std::max(uv_max[1], uv_corners[i][1]);
++    }
++
++    rectf.xmin = uv_min[0];
++    rectf.ymin = uv_min[1];
++    rectf.xmax = uv_max[0];
++    rectf.ymax = uv_max[1];
++  }
++  else {
++    ui::view2d_region_to_view_rctf(&region->v2d, &ts->uv_custom_region, &ts->uv_custom_region);
++  }
++
+   ts->uv_flag |= UV_FLAG_CUSTOM_REGION;
+ 
+   return OPERATOR_FINISHED;
+diff --git a/source/blender/editors/uvedit/uvedit_smart_stitch.cc b/source/blender/editors/uvedit/uvedit_smart_stitch.cc
+index f5e7e1708b5..7073593dc57 100644
+--- a/source/blender/editors/uvedit/uvedit_smart_stitch.cc
++++ b/source/blender/editors/uvedit/uvedit_smart_stitch.cc
+@@ -34,6 +34,7 @@
+ 
+ #include "DEG_depsgraph.hh"
+ 
++#include "ED_image.hh"
+ #include "ED_mesh.hh"
+ #include "ED_screen.hh"
+ #include "ED_space_api.hh"
+@@ -2464,9 +2465,11 @@ static StitchState *stitch_select(bContext *C,
+   /* add uv under mouse to processed uv's */
+   float co[2];
+   ARegion *region = CTX_wm_region(C);
++  SpaceImage *sima = CTX_wm_space_image(C);
+   UvNearestHit hit = uv_nearest_hit_init_max(&region->v2d);
+ 
+-  ui::view2d_region_to_view(&region->v2d, event->mval[0], event->mval[1], &co[0], &co[1]);
++  /* Use rotation-compensated coordinates for correct stitch selection when canvas is rotated. */
++  ED_image_mouse_pos_rotated(sima, region, event->mval, co);
+ 
+   if (ssc->mode == STITCH_VERT) {
+     if (uv_find_nearest_vert_multi(scene, {ssc->objects, ssc->objects_len}, co, 0.0f, &hit)) {
+diff --git a/source/blender/makesdna/DNA_space_types.h b/source/blender/makesdna/DNA_space_types.h
+index f1e798ad8ce..82f311ed69d 100644
+--- a/source/blender/makesdna/DNA_space_types.h
++++ b/source/blender/makesdna/DNA_space_types.h
+@@ -649,6 +649,13 @@ struct SpaceImage {
+   float xof = 0, yof = 0;
+   /** User defined zoom level. */
+   float zoom = 0;
++  /** Canvas rotation in radians. */
++  float rotation = 0;
++  /** Pivot point for canvas rotation in UV space (default: 0.5, 0.5 = center). */
++  float rotation_pivot[2] = {0.5f, 0.5f};
++  /** Cached sin/cos for rotation (updated when rotation changes). */
++  float rotation_sin = 0;
++  float rotation_cos = 1;
+   /** Storage for offset while render drawing. */
+   float centx = 0, centy = 0;
+ 
+@@ -671,7 +678,7 @@ struct SpaceImage {
+   char gizmo_flag = 0;
+ 
+   char grid_shape_source = 0;
+-  char _pad1[6] = {};
++  char _pad1[10] = {};
+ 
+   int flag = 0;
+ 
+diff --git a/source/blender/makesrna/intern/rna_space.cc b/source/blender/makesrna/intern/rna_space.cc
+index 4adb166e9f7..d9ea0da7654 100644
+--- a/source/blender/makesrna/intern/rna_space.cc
++++ b/source/blender/makesrna/intern/rna_space.cc
+@@ -6251,6 +6251,19 @@ static void rna_def_space_image(BlenderRNA *brna)
+   RNA_def_property_ui_range(prop, 25, 400, 100, 0);
+   RNA_def_property_ui_text(prop, "Zoom", "Zoom percentage");
+ 
++  prop = RNA_def_property(srna, "rotation", PROP_FLOAT, PROP_ANGLE);
++  RNA_def_property_float_sdna(prop, nullptr, "rotation");
++  RNA_def_property_ui_text(prop, "Rotation", "Canvas rotation angle");
++  RNA_def_property_range(prop, -M_PI, M_PI);
++  RNA_def_property_update(prop, NC_SPACE | ND_SPACE_IMAGE, nullptr);
++
++  prop = RNA_def_property(srna, "rotation_pivot", PROP_FLOAT, PROP_XYZ);
++  RNA_def_property_float_sdna(prop, nullptr, "rotation_pivot");
++  RNA_def_property_array(prop, 2);
++  RNA_def_property_ui_text(prop, "Rotation Pivot", "Pivot point for canvas rotation in UV space");
++  RNA_def_property_range(prop, 0.0, 1.0);
++  RNA_def_property_update(prop, NC_SPACE | ND_SPACE_IMAGE, nullptr);
++
+   /* image draw */
+   prop = RNA_def_property(srna, "show_repeat", PROP_BOOLEAN, PROP_NONE);
+   RNA_def_property_boolean_sdna(prop, nullptr, "flag", SI_DRAW_TILE);
+-- 
+2.53.0.windows.1
+

@@ -1,0 +1,1052 @@
+diff --git a/scripts/startup/bl_ui/space_image.py b/scripts/startup/bl_ui/space_image.py
+index 1e32aff9b7a..17a8d862db9 100644
+--- a/scripts/startup/bl_ui/space_image.py
++++ b/scripts/startup/bl_ui/space_image.py
+@@ -1146,6 +1146,11 @@ class IMAGE_PT_view_display(Panel):
+ 
+         col = layout.column()
+ 
++        for region in context.area.regions:
++            if region.type == 'WINDOW':
++                col.prop(region.view2d, "rotation", text="Canvas Rotation")
++                break
++
+         if ima:
+             col.prop(ima, "display_aspect", text="Aspect Ratio")
+             row = col.row()
+diff --git a/source/blender/editors/include/UI_view2d.hh b/source/blender/editors/include/UI_view2d.hh
+index ed1d8cd47fe..c15fb66c8b8 100644
+--- a/source/blender/editors/include/UI_view2d.hh
++++ b/source/blender/editors/include/UI_view2d.hh
+@@ -30,6 +30,7 @@ struct rctf;
+ struct rcti;
+ struct wmEvent;
+ struct wmGizmoGroupType;
++struct wmGizmoType;
+ struct wmKeyConfig;
+ struct wmOperator;
+ struct wmOperatorType;
+@@ -373,6 +374,11 @@ void view2d_view_to_region_rcti(const View2D *v2d, const rctf *rect_src, rcti *r
+ bool view2d_view_to_region_rcti_clip(const View2D *v2d, const rctf *rect_src, rcti *rect_dst)
+     ATTR_NONNULL();
+ 
++/**
++ * Compute the aspect ratio for View2D rotation, taking mask bounding box into account.
++ */
++float UI_view2d_rotation_aspect(const View2D *v2d);
++
+ /** \} */
+ 
+ /* -------------------------------------------------------------------- */
+@@ -505,6 +511,10 @@ void view2d_smooth_view(const bContext *C, ARegion *region, const rctf *cur, int
+  */
+ void VIEW2D_GGT_navigate_impl(wmGizmoGroupType *gzgt, const char *idname);
+ 
++/* `view2d_gizmo_navigate_type.cc` */
++
++void VIEW2D_GT_navigate_rotate(wmGizmoType *gzt);
++
+ /** \} */
+ 
+ /* -------------------------------------------------------------------- */
+diff --git a/source/blender/editors/interface/CMakeLists.txt b/source/blender/editors/interface/CMakeLists.txt
+index a7c0874f032..a3b26055af0 100644
+--- a/source/blender/editors/interface/CMakeLists.txt
++++ b/source/blender/editors/interface/CMakeLists.txt
+@@ -100,6 +100,7 @@ set(SRC
+   view2d/view2d_draw.cc
+   view2d/view2d_edge_pan.cc
+   view2d/view2d_gizmo_navigate.cc
++  view2d/view2d_gizmo_navigate_type.cc
+   view2d/view2d_ops.cc
+   views/abstract_view.cc
+   views/abstract_view_item.cc
+diff --git a/source/blender/editors/interface/view2d/view2d.cc b/source/blender/editors/interface/view2d/view2d.cc
+index 9cbebd3d3a1..f0f83877165 100644
+--- a/source/blender/editors/interface/view2d/view2d.cc
++++ b/source/blender/editors/interface/view2d/view2d.cc
+@@ -1094,6 +1094,99 @@ static void view2d_map_cur_using_mask(const View2D *v2d, rctf *r_curmasked)
+   }
+ }
+ 
++/* -------------------------------------------------------------------- */
++/** \name Rotation Helpers
++ *
++ * Shared helpers for applying 2D canvas rotation in coordinate transforms.
++ * \{ */
++
++float UI_view2d_rotation_aspect(const View2D *v2d)
++{
++  const float cur_width = BLI_rctf_size_x(&v2d->cur);
++  const float cur_height = BLI_rctf_size_y(&v2d->cur);
++  const float mask_width = float(BLI_rcti_size_x(&v2d->mask));
++  const float mask_height = float(BLI_rcti_size_y(&v2d->mask));
++
++  if (cur_width != 0.0f && cur_height != 0.0f && mask_width != 0.0f) {
++    return (mask_height / cur_height) / (mask_width / cur_width);
++  }
++  return 1.0f;
++}
++
++/**
++ * Compute the rotation pivot and aspect ratio for a View2D.
++ * Used by all rotation transform functions to avoid duplicating this logic.
++ */
++static void view2d_rotation_params(const View2D *v2d,
++                                   float *r_cx,
++                                   float *r_cy,
++                                   float *r_aspect)
++{
++  *r_aspect = UI_view2d_rotation_aspect(v2d);
++  if (v2d->flag & V2D_CUSTOM_ROTATION_PIVOT) {
++    *r_cx = v2d->rotation_pivot[0];
++    *r_cy = v2d->rotation_pivot[1];
++  }
++  else {
++    *r_cx = BLI_rctf_cent_x(&v2d->cur);
++    *r_cy = BLI_rctf_cent_y(&v2d->cur);
++  }
++}
++
++/**
++ * Apply the GPU rotation matrix for View2D canvas rotation.
++ * Used by view2d_view_ortho and view2d_view_orthoSpecial.
++ */
++static void view2d_apply_rotation_matrix(const View2D *v2d)
++{
++  float cx, cy, aspect;
++  view2d_rotation_params(v2d, &cx, &cy, &aspect);
++
++  GPU_matrix_translate_2f(cx, cy);
++  GPU_matrix_scale_2f(1.0f, 1.0f / aspect);
++  GPU_matrix_rotate_2d(RAD2DEGF(-v2d->rotation));
++  GPU_matrix_scale_2f(1.0f, aspect);
++  GPU_matrix_translate_2f(-cx, -cy);
++}
++
++/**
++ * Rotate a point from view-space to rotated-view-space (forward rotation).
++ * Used by view2d_region_to_view.
++ */
++static void view2d_rotate_point_forward(
++    const View2D *v2d, float *r_x, float *r_y)
++{
++  float cx, cy, aspect;
++  view2d_rotation_params(v2d, &cx, &cy, &aspect);
++
++  const float dx = *r_x - cx;
++  const float dy = (*r_y - cy) * aspect;
++  const float cos_r = cosf(v2d->rotation);
++  const float sin_r = sinf(v2d->rotation);
++  *r_x = cx + dx * cos_r - dy * sin_r;
++  *r_y = cy + (dx * sin_r + dy * cos_r) / aspect;
++}
++
++/**
++ * Rotate a point from rotated-view-space back to view-space (inverse rotation).
++ * Used by view2d_view_to_region_clip, view2d_view_to_region, view2d_view_to_region_fl.
++ */
++static void view2d_rotate_point_inverse(
++    const View2D *v2d, float *r_x, float *r_y)
++{
++  float cx, cy, aspect;
++  view2d_rotation_params(v2d, &cx, &cy, &aspect);
++
++  const float dx = *r_x - cx;
++  const float dy = (*r_y - cy) * aspect;
++  const float cos_r = cosf(-v2d->rotation);
++  const float sin_r = sinf(-v2d->rotation);
++  *r_x = cx + dx * cos_r - dy * sin_r;
++  *r_y = cy + (dx * sin_r + dy * cos_r) / aspect;
++}
++
++/** \} */
++
+ void view2d_view_ortho(const View2D *v2d)
+ {
+   rctf curmasked;
+@@ -1133,6 +1226,10 @@ void view2d_view_ortho(const View2D *v2d)
+ 
+   /* set matrix on all appropriate axes */
+   wmOrtho2(curmasked.xmin, curmasked.xmax, curmasked.ymin, curmasked.ymax);
++
++  if (v2d->rotation != 0.0f) {
++    view2d_apply_rotation_matrix(v2d);
++  }
+ }
+ 
+ void view2d_view_orthoSpecial(ARegion *region, View2D *v2d, const bool xaxis)
+@@ -1159,6 +1256,10 @@ void view2d_view_orthoSpecial(ARegion *region, View2D *v2d, const bool xaxis)
+   else {
+     wmOrtho2(-xofs, region->winx - xofs, curmasked.ymin - yofs, curmasked.ymax - yofs);
+   }
++
++  if (v2d->rotation != 0.0f) {
++    view2d_apply_rotation_matrix(v2d);
++  }
+ }
+ 
+ void view2d_view_restore(const bContext *C)
+@@ -1667,8 +1768,14 @@ float view2d_region_to_view_y(const View2D *v2d, float y)
+ 
+ void view2d_region_to_view(const View2D *v2d, float x, float y, float *r_view_x, float *r_view_y)
+ {
+-  *r_view_x = view2d_region_to_view_x(v2d, x);
+-  *r_view_y = view2d_region_to_view_y(v2d, y);
++  float vx = view2d_region_to_view_x(v2d, x);
++  float vy = view2d_region_to_view_y(v2d, y);
++
++  if (v2d->rotation != 0.0f) {
++    view2d_rotate_point_forward(v2d, &vx, &vy);
++  }
++  *r_view_x = vx;
++  *r_view_y = vy;
+ }
+ 
+ void view2d_region_to_view_rctf(const View2D *v2d, const rctf *rect_src, rctf *rect_dst)
+@@ -1701,6 +1808,10 @@ float view2d_view_to_region_y(const View2D *v2d, float y)
+ bool view2d_view_to_region_clip(
+     const View2D *v2d, float x, float y, int *r_region_x, int *r_region_y)
+ {
++  if (v2d->rotation != 0.0f) {
++    view2d_rotate_point_inverse(v2d, &x, &y);
++  }
++
+   /* express given coordinates as proportional values */
+   x = (x - v2d->cur.xmin) / BLI_rctf_size_x(&v2d->cur);
+   y = (y - v2d->cur.ymin) / BLI_rctf_size_y(&v2d->cur);
+@@ -1721,6 +1832,10 @@ bool view2d_view_to_region_clip(
+ 
+ void view2d_view_to_region(const View2D *v2d, float x, float y, int *r_region_x, int *r_region_y)
+ {
++  if (v2d->rotation != 0.0f) {
++    view2d_rotate_point_inverse(v2d, &x, &y);
++  }
++
+   /* Step 1: express given coordinates as proportional values. */
+   x = (x - v2d->cur.xmin) / BLI_rctf_size_x(&v2d->cur);
+   y = (y - v2d->cur.ymin) / BLI_rctf_size_y(&v2d->cur);
+@@ -1737,6 +1852,10 @@ void view2d_view_to_region(const View2D *v2d, float x, float y, int *r_region_x,
+ void view2d_view_to_region_fl(
+     const View2D *v2d, float x, float y, float *r_region_x, float *r_region_y)
+ {
++  if (v2d->rotation != 0.0f) {
++    view2d_rotate_point_inverse(v2d, &x, &y);
++  }
++
+   /* express given coordinates as proportional values */
+   x = (x - v2d->cur.xmin) / BLI_rctf_size_x(&v2d->cur);
+   y = (y - v2d->cur.ymin) / BLI_rctf_size_y(&v2d->cur);
+@@ -1747,8 +1866,8 @@ void view2d_view_to_region_fl(
+ }
+ 
+ bool view2d_view_to_region_segment_clip(const View2D *v2d,
+-                                        const float xy_a[2],
+-                                        const float xy_b[2],
++                                        const float xy_a_in[2],
++                                        const float xy_b_in[2],
+                                         int r_region_a[2],
+                                         int r_region_b[2])
+ {
+@@ -1756,6 +1875,14 @@ bool view2d_view_to_region_segment_clip(const View2D *v2d,
+   rect_unit.xmin = rect_unit.ymin = 0.0f;
+   rect_unit.xmax = rect_unit.ymax = 1.0f;
+ 
++  float xy_a[2] = {xy_a_in[0], xy_a_in[1]};
++  float xy_b[2] = {xy_b_in[0], xy_b_in[1]};
++
++  if (v2d->rotation != 0.0f) {
++    view2d_rotate_point_inverse(v2d, &xy_a[0], &xy_a[1]);
++    view2d_rotate_point_inverse(v2d, &xy_b[0], &xy_b[1]);
++  }
++
+   /* Express given coordinates as proportional values. */
+   const float s_a[2] = {
+       (xy_a[0] - v2d->cur.xmin) / BLI_rctf_size_x(&v2d->cur),
+diff --git a/source/blender/editors/interface/view2d/view2d_gizmo_navigate.cc b/source/blender/editors/interface/view2d/view2d_gizmo_navigate.cc
+index d3f63904a69..0cc2d9128c9 100644
+--- a/source/blender/editors/interface/view2d/view2d_gizmo_navigate.cc
++++ b/source/blender/editors/interface/view2d/view2d_gizmo_navigate.cc
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "BLI_utildefines.h"
++#include "BLI_math_vector.h"
+ 
+ #include "BKE_context.hh"
+ 
+@@ -46,8 +47,9 @@ namespace {
+ enum {
+   GZ_INDEX_MOVE = 0,
+   GZ_INDEX_ZOOM = 1,
++  GZ_INDEX_ROTATE = 2,
+ 
+-  GZ_INDEX_TOTAL = 2,
++  GZ_INDEX_TOTAL = 3,
+ };
+ 
+ struct NavigateGizmoInfo {
+@@ -77,6 +79,11 @@ static NavigateGizmoInfo g_navigate_params_for_space_image[GZ_INDEX_TOTAL] = {
+         "GIZMO_GT_button_2d",
+         ICON_VIEW_ZOOM,
+     },
++    {
++        "VIEW2D_OT_rotate",
++        "VIEW2D_GT_navigate_rotate",
++        ICON_NONE,
++    },
+ };
+ 
+ static NavigateGizmoInfo g_navigate_params_for_space_clip[GZ_INDEX_TOTAL] = {
+@@ -90,6 +97,11 @@ static NavigateGizmoInfo g_navigate_params_for_space_clip[GZ_INDEX_TOTAL] = {
+         "GIZMO_GT_button_2d",
+         ICON_VIEW_ZOOM,
+     },
++    {
++        "VIEW2D_OT_rotate",
++        "VIEW2D_GT_navigate_rotate",
++        ICON_NONE,
++    },
+ };
+ 
+ static NavigateGizmoInfo g_navigate_params_for_view2d[GZ_INDEX_TOTAL] = {
+@@ -103,6 +115,11 @@ static NavigateGizmoInfo g_navigate_params_for_view2d[GZ_INDEX_TOTAL] = {
+         "GIZMO_GT_button_2d",
+         ICON_VIEW_ZOOM,
+     },
++    {
++        "VIEW2D_OT_rotate",
++        "VIEW2D_GT_navigate_rotate",
++        ICON_NONE,
++    },
+ };
+ 
+ static NavigateGizmoInfo *navigate_params_from_space_type(short space_type)
+@@ -166,7 +183,13 @@ static void WIDGETGROUP_navigate_setup(const bContext * /*C*/, wmGizmoGroup *gzg
+     wmGizmo *gz = navgroup->gz_array[i];
+     gz->flag |= WM_GIZMO_MOVE_CURSOR | WM_GIZMO_DRAW_MODAL;
+ 
+-    {
++    if (i == GZ_INDEX_ROTATE) {
++      /* Custom gizmo draws its own visuals; transparent base colors. */
++      gz->color[3] = 0.0f;
++      copy_v3_fl(gz->color_hi, 0.5f);
++      gz->color_hi[3] = 0.5f;
++    }
++    else {
+       uchar icon_color[3];
+       theme::get_color_3ubv(TH_TEXT, icon_color);
+       int color_tint, color_tint_hi;
+@@ -190,9 +213,11 @@ static void WIDGETGROUP_navigate_setup(const bContext * /*C*/, wmGizmoGroup *gzg
+     gz->scale_basis = (GIZMO_SIZE * GIZMO_MINI_FAC) / 2;
+     if (info->icon != 0) {
+       PropertyRNA *prop = RNA_struct_find_property(gz->ptr, "icon");
+-      RNA_property_enum_set(gz->ptr, prop, info->icon);
+-      RNA_enum_set(
+-          gz->ptr, "draw_options", ED_GIZMO_BUTTON_SHOW_OUTLINE | ED_GIZMO_BUTTON_SHOW_BACKDROP);
++      if (prop) {
++        RNA_property_enum_set(gz->ptr, prop, info->icon);
++        RNA_enum_set(
++            gz->ptr, "draw_options", ED_GIZMO_BUTTON_SHOW_OUTLINE | ED_GIZMO_BUTTON_SHOW_BACKDROP);
++      }
+     }
+ 
+     wmOperatorType *ot = WM_operatortype_find(info->opname, false);
+@@ -206,7 +231,7 @@ static void WIDGETGROUP_navigate_setup(const bContext * /*C*/, wmGizmoGroup *gzg
+ 
+   /* Modal operators, don't use initial mouse location since we're clicking on a button. */
+   {
+-    int gz_ids[] = {GZ_INDEX_ZOOM};
++    int gz_ids[] = {GZ_INDEX_ZOOM, GZ_INDEX_ROTATE};
+     for (int i = 0; i < ARRAY_SIZE(gz_ids); i++) {
+       wmGizmo *gz = navgroup->gz_array[gz_ids[i]];
+       wmGizmoOpElem *gzop = WM_gizmo_operator_get(gz, 0);
+@@ -234,9 +259,11 @@ static void WIDGETGROUP_navigate_draw_prepare(const bContext *C, wmGizmoGroup *g
+ 
+   const float icon_size = GIZMO_SIZE;
+   const float icon_offset_mini = icon_size * GIZMO_MINI_OFFSET_FAC * UI_SCALE_FAC;
+-  const float co[2] = {
+-      roundf(rect_visible->xmax - (icon_offset_mini * 0.75f)),
+-      roundf(rect_visible->ymax - (icon_offset_mini * 0.75f)),
++  /* Position for the rotate gizmo (compass) — centered with its radius. */
++  const float rotate_radius = 40.0f * UI_SCALE_FAC;
++  const float co_rotate[2] = {
++      roundf(rect_visible->xmax - rotate_radius - (4.0f * UI_SCALE_FAC)),
++      roundf(rect_visible->ymax - rotate_radius - (4.0f * UI_SCALE_FAC)),
+   };
+ 
+   wmGizmo *gz;
+@@ -246,16 +273,25 @@ static void WIDGETGROUP_navigate_draw_prepare(const bContext *C, wmGizmoGroup *g
+     WM_gizmo_set_flag(gz, WM_GIZMO_HIDDEN, true);
+   }
+ 
+-  int icon_mini_slot = 0;
++  /* Rotate gizmo (compass) at the top. */
++  gz = navgroup->gz_array[GZ_INDEX_ROTATE];
++  gz->matrix_basis[3][0] = roundf(co_rotate[0]);
++  gz->matrix_basis[3][1] = roundf(co_rotate[1]);
++  WM_gizmo_set_flag(gz, WM_GIZMO_HIDDEN, false);
++
++  /* Mini buttons below the compass, aligned to the right. */
++  const float mini_co_x = roundf(rect_visible->xmax - (22.5f * UI_SCALE_FAC));
++  float mini_co_y = roundf(co_rotate[1] - rotate_radius - (icon_offset_mini * 0.5f));
+ 
+   gz = navgroup->gz_array[GZ_INDEX_ZOOM];
+-  gz->matrix_basis[3][0] = roundf(co[0]);
+-  gz->matrix_basis[3][1] = roundf(co[1] - (icon_offset_mini * icon_mini_slot++));
++  gz->matrix_basis[3][0] = mini_co_x;
++  gz->matrix_basis[3][1] = mini_co_y;
+   WM_gizmo_set_flag(gz, WM_GIZMO_HIDDEN, false);
++  mini_co_y -= icon_offset_mini;
+ 
+   gz = navgroup->gz_array[GZ_INDEX_MOVE];
+-  gz->matrix_basis[3][0] = roundf(co[0]);
+-  gz->matrix_basis[3][1] = roundf(co[1] - (icon_offset_mini * icon_mini_slot++));
++  gz->matrix_basis[3][0] = mini_co_x;
++  gz->matrix_basis[3][1] = mini_co_y;
+   WM_gizmo_set_flag(gz, WM_GIZMO_HIDDEN, false);
+ }
+ 
+diff --git a/source/blender/editors/interface/view2d/view2d_gizmo_navigate_type.cc b/source/blender/editors/interface/view2d/view2d_gizmo_navigate_type.cc
+new file mode 100644
+index 00000000000..f1c49827d64
+--- /dev/null
++++ b/source/blender/editors/interface/view2d/view2d_gizmo_navigate_type.cc
+@@ -0,0 +1,362 @@
++/* SPDX-FileCopyrightText: 2024 Blender Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++/** \file
++ * \ingroup edinterface
++ *
++ * \name Custom 2D Navigation Rotation Gizmo
++ *
++ * \brief Circle-shaped compass gizmo for 2D canvas rotation.
++ * Draws a circle background with X/Y axis indicators and rotation angle.
++ *
++ * Modeled after VIEW3D_GT_navigate_rotate but simplified for 2D views.
++ */
++
++#include <cmath>
++
++#include "BLI_math_base.h"
++#include "BLI_math_vector.h"
++#include "BLI_rect.h"
++
++#include "BKE_context.hh"
++
++#include "GPU_immediate.hh"
++#include "GPU_immediate_util.hh"
++#include "GPU_matrix.hh"
++#include "GPU_state.hh"
++
++#include "BLF_api.hh"
++
++#include "UI_interface.hh"
++#include "UI_resources.hh"
++#include "UI_view2d.hh"
++
++#include "WM_api.hh"
++#include "WM_types.hh"
++
++#include "ED_gizmo_library.hh"
++#include "ED_screen.hh"
++
++#include "DNA_view2d_types.h"
++
++namespace blender::ui {
++
++/** Radius of the entire gizmo background in pixels. */
++static constexpr float V2D_NAV_RADIUS_FAC = 40.0f;
++/** Size of axis handle balls relative to radius. */
++static constexpr float V2D_AXIS_HANDLE_SIZE = 0.22f;
++/** Font size for labels relative to radius. */
++static constexpr float V2D_AXIS_TEXT_FAC = V2D_AXIS_HANDLE_SIZE * 1.3f;
++/** Scale factor for the center ball relative to standard axis balls. */
++static constexpr float V2D_CENTER_BALL_SCALE = 1.08f;
++
++static float v2d_nav_radius()
++{
++  return V2D_NAV_RADIUS_FAC * UI_SCALE_FAC;
++}
++
++static float v2d_axis_line_width()
++{
++  return 2.0f * U.pixelsize;
++}
++
++static float v2d_axis_ring_width()
++{
++  return 1.5f * U.pixelsize;
++}
++
++/* -------------------------------------------------------------------- */
++/** \name Axis Drawing Helpers
++ * \{ */
++
++struct AxisInfo {
++  float angle_offset;
++  int axis;  /* 0=X, 1=Y */
++  bool is_pos;
++};
++
++static constexpr AxisInfo g_axes[4] = {
++    {0.0f, 0, true},            /* +X: right */
++    {float(M_PI), 0, false},    /* -X: left */
++    {float(M_PI_2), 1, true},   /* +Y: up */
++    {float(-M_PI_2), 1, false}, /* -Y: down */
++};
++
++/**
++ * Compute the highlight part index for an axis.
++ * Part indices: 1=+X, 2=-X, 3=+Y, 4=-Y, 5=center.
++ */
++static int v2d_axis_part_index(const int axis, const bool is_pos)
++{
++  return (axis * 2) + (is_pos ? 1 : 2);
++}
++
++/** \} */
++
++/* -------------------------------------------------------------------- */
++/** \name Draw
++ * \{ */
++
++static void v2d_navigate_draw(const bContext *C, wmGizmo *gz)
++{
++  const ARegion *region = CTX_wm_region(C);
++  const View2D *v2d = &region->v2d;
++  const float rotation = v2d->rotation;
++  const bool is_hover = ((gz->state & WM_GIZMO_STATE_HIGHLIGHT) != 0);
++
++  const float cx = gz->matrix_basis[3][0];
++  const float cy = gz->matrix_basis[3][1];
++  const float rad = v2d_nav_radius();
++  const float line_width = v2d_axis_line_width();
++  const float ring_width = v2d_axis_ring_width();
++  const float ball_rad = rad * V2D_AXIS_HANDLE_SIZE;
++  const float length_frac = 1.0f - V2D_AXIS_HANDLE_SIZE;
++
++  /* Background color of the space, used to mix axis colors. */
++  float view_color[4];
++  ui::theme::get_color_3fv(TH_BACK, view_color);
++  view_color[3] = 1.0f;
++
++  float viewport_size[4];
++  GPU_viewport_size_get_f(viewport_size);
++
++  /* Font setup. */
++  const int font_id = BLF_default();
++  BLF_disable(font_id, BLF_ROTATION | BLF_SHADOW | BLF_ASPECT | BLF_WORD_WRAP);
++  BLF_enable(font_id, BLF_BOLD);
++  BLF_size(font_id, rad * V2D_AXIS_TEXT_FAC);
++
++  draw_roundbox_corner_set(ui::CNR_ALL);
++  GPU_polygon_smooth(false);
++  GPU_blend(GPU_BLEND_ALPHA);
++
++  /* Background circle — visible only on hover. */
++  if (is_hover) {
++    const float bg_color[4] = {0.45f, 0.45f, 0.45f, 0.4f};
++    GPU_matrix_push();
++    GPU_matrix_translate_2f(cx, cy);
++    const rctf rect = {-rad, rad, -rad, rad};
++    ui::draw_roundbox_4fv(&rect, true, rad, bg_color);
++    GPU_matrix_pop();
++  }
++
++  /* Draw axes (+X, -X, +Y, -Y). */
++  for (int i = 0; i < 4; i++) {
++    const int axis = g_axes[i].axis;
++    const bool is_pos = g_axes[i].is_pos;
++    const int part_index = v2d_axis_part_index(axis, is_pos);
++    const bool is_highlight = (part_index == gz->highlight_part);
++
++    /* Axis theme color. */
++    float axis_color[4];
++    ui::theme::get_color_3fv(TH_AXIS_X + axis, axis_color);
++    axis_color[3] = 1.0f;
++
++    /* Compute axis endpoint. Negate rotation to match canvas direction. */
++    const float a = -rotation + g_axes[i].angle_offset;
++    const float ex = cx + cosf(a) * rad * length_frac;
++    const float ey = cy + sinf(a) * rad * length_frac;
++
++    /* Color: positive axes use full color, negative axes use dimmed. */
++    float color[4];
++    interp_v4_v4v4(color, view_color, axis_color, is_pos ? 0.75f : 0.25f);
++    if (!is_pos) {
++      color[3] = 1.0f;
++    }
++
++    /* Axis line. */
++    {
++      float sx = cx, sy = cy;
++      const float len = len_v2v2(float2{sx, sy}, float2{ex, ey});
++      if (len > 0.0f) {
++        const float dx = (ex - sx) / len;
++        const float dy = (ey - sy) / len;
++        sx -= dx * (line_width * 0.66f);
++        sy -= dy * (line_width * 0.66f);
++      }
++
++      GPUVertFormat *format = immVertexFormat();
++      const uint pos_id = GPU_vertformat_attr_add(
++          format, "pos", gpu::VertAttrType::SFLOAT_32_32_32);
++      const uint color_id = GPU_vertformat_attr_add(
++          format, "color", gpu::VertAttrType::SFLOAT_32_32_32_32);
++
++      immBindBuiltinProgram(GPU_SHADER_3D_POLYLINE_SMOOTH_COLOR);
++      immUniform2fv("viewportSize", &viewport_size[2]);
++      immUniform1f("lineWidth", line_width);
++      immBegin(GPU_PRIM_LINES, 2);
++      immAttr4fv(color_id, color);
++      immVertex3f(pos_id, sx, sy, 0.0f);
++      immAttr4fv(color_id, color);
++      immVertex3f(pos_id, ex, ey, 0.0f);
++      immEnd();
++      immUnbindProgram();
++    }
++
++    /* Axis ball. */
++    {
++      GPU_matrix_push();
++      GPU_matrix_translate_2f(ex, ey);
++      const rctf rect = {-ball_rad, ball_rad, -ball_rad, ball_rad};
++      ui::draw_roundbox_4fv_ex(&rect, color, nullptr, 0.0f, color, ring_width, ball_rad);
++      GPU_matrix_pop();
++    }
++
++    /* Axis label. */
++    if (is_pos || is_highlight) {
++      char label[3];
++      if (is_pos) {
++        label[0] = char('X' + axis);
++        label[1] = '\0';
++      }
++      else {
++        label[0] = '-';
++        label[1] = char('X' + axis);
++        label[2] = '\0';
++      }
++
++      float tw, th;
++      BLF_width_and_height(font_id, label, strlen(label), &tw, &th);
++
++      float text_color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
++      if (!is_highlight) {
++        zero_v4(text_color);
++        text_color[3] = is_hover ? 1.0f : 0.9f;
++      }
++
++      BLF_position(font_id,
++                    roundf(ex - tw * (is_pos ? 0.5f : 0.55f)),
++                    roundf(ey - th * 0.5f),
++                    0.0f);
++      BLF_color4fv(font_id, text_color);
++      BLF_draw(font_id, label, strlen(label));
++    }
++  }
++
++  /* Center ball — rotation angle readout. */
++  {
++    const bool is_highlight = (gz->highlight_part == 5);
++
++    float z_color[4];
++    ui::theme::get_color_3fv(TH_AXIS_Z, z_color);
++    z_color[3] = 1.0f;
++
++    float color[4];
++    interp_v4_v4v4(color, view_color, z_color, 0.75f);
++
++    const float center_rad = ball_rad * V2D_CENTER_BALL_SCALE;
++    GPU_matrix_push();
++    GPU_matrix_translate_2f(cx, cy);
++    const rctf rect = {-center_rad, center_rad, -center_rad, center_rad};
++    ui::draw_roundbox_4fv_ex(&rect, color, nullptr, 0.0f, color, ring_width, center_rad);
++    GPU_matrix_pop();
++
++    /* Format angle string. */
++    char angle_str[16];
++    float degrees = fmodf(RAD2DEGF(rotation), 360.0f);
++    if (degrees < 0.0f) {
++      degrees += 360.0f;
++    }
++    snprintf(angle_str, sizeof(angle_str), "%.0f\xC2\xB0", degrees);
++
++    BLF_size(font_id, rad * V2D_AXIS_TEXT_FAC * 0.85f);
++
++    float tw, th;
++    BLF_width_and_height(font_id, angle_str, strlen(angle_str), &tw, &th);
++
++    float text_color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
++    if (!is_highlight) {
++      zero_v4(text_color);
++      text_color[3] = is_hover ? 1.0f : 0.9f;
++    }
++
++    BLF_position(font_id, roundf(cx - tw * 0.5f), roundf(cy - th * 0.5f), 0.0f);
++    BLF_color4fv(font_id, text_color);
++    BLF_draw(font_id, angle_str, strlen(angle_str));
++  }
++
++  GPU_blend(GPU_BLEND_NONE);
++  BLF_disable(font_id, BLF_BOLD);
++}
++
++/** \} */
++
++/* -------------------------------------------------------------------- */
++/** \name Hit Detection
++ * \{ */
++
++static int v2d_navigate_test_select(bContext *C, wmGizmo *gz, const int mval[2])
++{
++  const float rad = v2d_nav_radius();
++  const float point_local[2] = {float(mval[0]) - gz->matrix_basis[3][0],
++                                float(mval[1]) - gz->matrix_basis[3][1]};
++  const float len_sq = len_squared_v2(point_local);
++
++  if (len_sq > rad * rad) {
++    return -1;
++  }
++
++  const ARegion *region = CTX_wm_region(C);
++  if (!region) {
++    return 0;
++  }
++  const float rotation = region->v2d.rotation;
++
++  const float ball_rad = rad * V2D_AXIS_HANDLE_SIZE;
++  const float ball_rad_sq = ball_rad * ball_rad;
++  const float length_frac = 1.0f - V2D_AXIS_HANDLE_SIZE;
++
++  int best_part = -1;
++  float best_len_sq = FLT_MAX;
++
++  for (int i = 0; i < 4; i++) {
++    const float a = -rotation + g_axes[i].angle_offset;
++    const float ball_pos[2] = {cosf(a) * rad * length_frac, sinf(a) * rad * length_frac};
++    const float dist_sq = len_squared_v2v2(point_local, ball_pos);
++    if (dist_sq <= ball_rad_sq && dist_sq < best_len_sq) {
++      best_len_sq = dist_sq;
++      best_part = v2d_axis_part_index(g_axes[i].axis, g_axes[i].is_pos);
++    }
++  }
++
++  /* Center ball. */
++  const float center_rad = ball_rad * V2D_CENTER_BALL_SCALE;
++  if (len_sq <= center_rad * center_rad && len_sq < best_len_sq) {
++    best_part = 5;
++  }
++
++  return (best_part != -1) ? best_part : 0;
++}
++
++/** \} */
++
++static int v2d_navigate_cursor_get(wmGizmo * /*gz*/)
++{
++  return WM_CURSOR_DEFAULT;
++}
++
++static bool v2d_navigate_screen_bounds_get(const bContext *C, wmGizmo *gz, rcti *r_bounding_box)
++{
++  const ScrArea *area = CTX_wm_area(C);
++  const float rad = v2d_nav_radius();
++  r_bounding_box->xmin = int(gz->matrix_basis[3][0] + area->totrct.xmin - rad);
++  r_bounding_box->ymin = int(gz->matrix_basis[3][1] + area->totrct.ymin - rad);
++  r_bounding_box->xmax = int(gz->matrix_basis[3][0] + area->totrct.xmin + rad);
++  r_bounding_box->ymax = int(gz->matrix_basis[3][1] + area->totrct.ymin + rad);
++  return true;
++}
++
++void VIEW2D_GT_navigate_rotate(wmGizmoType *gzt)
++{
++  gzt->idname = "VIEW2D_GT_navigate_rotate";
++
++  gzt->draw = v2d_navigate_draw;
++  gzt->test_select = v2d_navigate_test_select;
++  gzt->cursor_get = v2d_navigate_cursor_get;
++  gzt->screen_bounds_get = v2d_navigate_screen_bounds_get;
++
++  gzt->struct_size = sizeof(wmGizmo);
++}
++
++}  // namespace blender::ui
+diff --git a/source/blender/editors/interface/view2d/view2d_ops.cc b/source/blender/editors/interface/view2d/view2d_ops.cc
+index 2e7236a5298..8e617e21f9e 100644
+--- a/source/blender/editors/interface/view2d/view2d_ops.cc
++++ b/source/blender/editors/interface/view2d/view2d_ops.cc
+@@ -172,6 +172,17 @@ static void view_pan_apply_ex(bContext *C, v2dViewPanData *vpd, float dx, float
+   dx *= vpd->facx;
+   dy *= vpd->facy;
+ 
++  /* Apply inverse rotation to convert screen-space deltas to cur-space deltas,
++   * so panning tracks the mouse globally regardless of canvas rotation. */
++  if (v2d->rotation != 0.0f) {
++    const float cos_r = cosf(v2d->rotation);
++    const float sin_r = sinf(v2d->rotation);
++    const float rdx = dx * cos_r + dy * sin_r;
++    const float rdy = -dx * sin_r + dy * cos_r;
++    dx = rdx;
++    dy = rdy;
++  }
++
+   if (!vpd->do_category_scroll) {
+     /* only move view on an axis if change is allowed */
+     if ((v2d->keepofs & V2D_LOCKOFS_X) == 0) {
+@@ -217,6 +228,138 @@ static void view_pan_exit(wmOperator *op)
+ 
+ /** \} */
+ 
++/* -------------------------------------------------------------------- */
++/** \name View Rotate Operator (modal drag)
++ * \{ */
++
++struct v2dViewRotateData {
++  bScreen *screen;
++  ScrArea *area;
++  ARegion *region;
++  View2D *v2d;
++
++  float start_angle;
++  float original_rotation;
++  bool own_cursor;
++};
++
++static float get_mouse_angle(ARegion *region, const int xy[2])
++{
++  const float cx = float(region->winx) / 2.0f;
++  const float cy = float(region->winy) / 2.0f;
++  return atan2f(float(xy[1]) - cy, float(xy[0]) - cx);
++}
++
++static void view_rotate_apply(bContext *C, v2dViewRotateData *vrd, float delta_angle)
++{
++  vrd->v2d->rotation = vrd->original_rotation + delta_angle;
++
++  /* clamp to -pi .. pi just to avoid huge floats over time */
++  while (vrd->v2d->rotation > float(M_PI)) {
++    vrd->v2d->rotation -= 2.0f * float(M_PI);
++  }
++  while (vrd->v2d->rotation < float(-M_PI)) {
++    vrd->v2d->rotation += 2.0f * float(M_PI);
++  }
++
++  view2d_curRect_changed(C, vrd->v2d);
++  ED_region_tag_redraw_no_rebuild(vrd->region);
++  WM_event_add_mousemove(CTX_wm_window(C));
++  view2d_sync(vrd->screen, vrd->area, vrd->v2d, V2D_LOCK_COPY);
++}
++
++static wmOperatorStatus view_rotate_invoke(bContext *C, wmOperator *op, const wmEvent *event)
++{
++  if (!view_pan_poll(C)) {
++    return OPERATOR_CANCELLED;
++  }
++
++  v2dViewRotateData *vrd = MEM_new_zeroed<v2dViewRotateData>(__func__);
++  op->customdata = vrd;
++
++  vrd->screen = CTX_wm_screen(C);
++  vrd->area = CTX_wm_area(C);
++  vrd->region = CTX_wm_region(C);
++  vrd->v2d = &vrd->region->v2d;
++  vrd->original_rotation = vrd->v2d->rotation;
++
++  vrd->start_angle = get_mouse_angle(vrd->region, event->xy);
++  vrd->v2d->flag |= V2D_IS_NAVIGATING;
++
++  wmWindow *window = CTX_wm_window(C);
++  if (WM_cursor_modal_is_set_ok(window)) {
++    WM_cursor_modal_set(window, WM_CURSOR_EW_SCROLL);
++    vrd->own_cursor = true;
++  }
++
++  WM_event_add_modal_handler(C, op);
++  return OPERATOR_RUNNING_MODAL;
++}
++
++static wmOperatorStatus view_rotate_modal(bContext *C, wmOperator *op, const wmEvent *event)
++{
++  v2dViewRotateData *vrd = static_cast<v2dViewRotateData *>(op->customdata);
++
++  if (event->type == MOUSEMOVE) {
++    const float angle = get_mouse_angle(vrd->region, event->xy);
++    float delta = angle - vrd->start_angle;
++    
++    /* handle wrap around */
++    if (delta > float(M_PI)) {
++      delta -= 2.0f * float(M_PI);
++    }
++    else if (delta < float(-M_PI)) {
++      delta += 2.0f * float(M_PI);
++    }
++
++    view_rotate_apply(C, vrd, delta);
++  }
++  else if (ELEM(event->type, LEFTMOUSE, MIDDLEMOUSE, RIGHTMOUSE, EVT_ESCKEY)) {
++    if (event->val == KM_RELEASE || event->type == EVT_ESCKEY) {
++      if (event->type == EVT_ESCKEY) {
++        view_rotate_apply(C, vrd, 0.0f); /* reset */
++      }
++      vrd->v2d->flag &= ~V2D_IS_NAVIGATING;
++      if (vrd->own_cursor) {
++        WM_cursor_modal_restore(CTX_wm_window(C));
++      }
++      MEM_delete(vrd);
++      op->customdata = nullptr;
++      return (event->type == EVT_ESCKEY) ? OPERATOR_CANCELLED : OPERATOR_FINISHED;
++    }
++  }
++
++  return OPERATOR_RUNNING_MODAL;
++}
++
++static void view_rotate_cancel(bContext *C, wmOperator *op)
++{
++  v2dViewRotateData *vrd = static_cast<v2dViewRotateData *>(op->customdata);
++  if (vrd) {
++    view_rotate_apply(C, vrd, 0.0f);
++    vrd->v2d->flag &= ~V2D_IS_NAVIGATING;
++    if (vrd->own_cursor) {
++      WM_cursor_modal_restore(CTX_wm_window(C));
++    }
++    MEM_delete(vrd);
++    op->customdata = nullptr;
++  }
++}
++
++static void VIEW2D_OT_rotate(wmOperatorType *ot)
++{
++  ot->name = "Rotate View";
++  ot->description = "Rotate the view";
++  ot->idname = "VIEW2D_OT_rotate";
++
++  ot->invoke = view_rotate_invoke;
++  ot->modal = view_rotate_modal;
++  ot->cancel = view_rotate_cancel;
++  ot->poll = view_pan_poll; /* We can use pan poll because if you can pan you can rotate typically */
++
++  ot->flag = OPTYPE_BLOCKING | OPTYPE_GRAB_CURSOR_XY;
++}
++
+ /* -------------------------------------------------------------------- */
+ /** \name View Pan Operator (modal drag-pan)
+  * \{ */
+@@ -2344,6 +2487,7 @@ void ED_operatortypes_view2d()
+ {
+   WM_operatortype_append(VIEW2D_OT_pan);
+   WM_operatortype_append(VIEW2D_OT_edge_pan);
++  WM_operatortype_append(VIEW2D_OT_rotate);
+ 
+   WM_operatortype_append(VIEW2D_OT_scroll_left);
+   WM_operatortype_append(VIEW2D_OT_scroll_right);
+diff --git a/source/blender/editors/space_image/space_image.cc b/source/blender/editors/space_image/space_image.cc
+index 5d3470ac0df..d10c45d72b3 100644
+--- a/source/blender/editors/space_image/space_image.cc
++++ b/source/blender/editors/space_image/space_image.cc
+@@ -697,6 +697,52 @@ static void image_main_region_set_view2d(SpaceImage *sima, ARegion *region)
+   region->v2d.cur.xmax /= w;
+   region->v2d.cur.ymin /= h;
+   region->v2d.cur.ymax /= h;
++
++  /* Enable custom rotation pivot for 2D rotation. */
++  region->v2d.flag |= V2D_CUSTOM_ROTATION_PIVOT;
++
++  float new_px = 0.5f;
++  float new_py = 0.5f;
++
++  if (ima && ima->source == IMA_SRC_TILED) {
++    ImageTile *active_tile = (ImageTile *)BLI_findlink(&ima->tiles, ima->active_tile_index);
++    if (active_tile) {
++      int tile_idx = active_tile->tile_number - 1001;
++      if (tile_idx >= 0) {
++        new_px = 0.5f + float(tile_idx % 10);
++        new_py = 0.5f + float(tile_idx / 10);
++      }
++    }
++  }
++
++  /* If the pivot changed during an active rotation, mathematically counteract the jump 
++   * by translating the base panning offsets so the visual position is locked. */
++  if (region->v2d.rotation_pivot[0] != new_px || region->v2d.rotation_pivot[1] != new_py) {
++    if (region->v2d.rotation != 0.0f) {
++      float aspect = blender::ui::UI_view2d_rotation_aspect(&region->v2d);
++      
++      float dx = new_px - region->v2d.rotation_pivot[0];
++      float dy = new_py - region->v2d.rotation_pivot[1];
++      
++      float c = cosf(-region->v2d.rotation);
++      float s = sinf(-region->v2d.rotation);
++      
++      float delta_x = dx - (c * dx - s * dy * aspect);
++      float delta_y = dy - ((s / aspect) * dx + c * dy);
++      
++      /* sima->xof contributes `sima->xof / w` to `v2d->cur.xmin`, multiply by `w` to un-normalize. */
++      sima->xof += delta_x * w;
++      sima->yof += delta_y * h;
++      
++      /* Also instantly apply this offset to the un-normalized `v2d->cur` for this frame */
++      region->v2d.cur.xmin += delta_x;
++      region->v2d.cur.xmax += delta_x;
++      region->v2d.cur.ymin += delta_y;
++      region->v2d.cur.ymax += delta_y;
++    }
++    region->v2d.rotation_pivot[0] = new_px;
++    region->v2d.rotation_pivot[1] = new_py;
++  }
+ }
+ 
+ /* add handlers, stuff you only do once or on area/region changes */
+diff --git a/source/blender/makesdna/DNA_view2d_types.h b/source/blender/makesdna/DNA_view2d_types.h
+index 40343f05a99..3438115b36d 100644
+--- a/source/blender/makesdna/DNA_view2d_types.h
++++ b/source/blender/makesdna/DNA_view2d_types.h
+@@ -73,6 +73,8 @@ enum {
+   /* Ignore keepofs flags only during zoom.
+    * Allows for different behavior between zooming and area resize. */
+   V2D_ZOOM_IGNORE_KEEPOFS = (1 << 12),
++  /* Use the explicit rotation_pivot for 2D rotation instead of active view center */
++  V2D_CUSTOM_ROTATION_PIVOT = (1 << 13),
+ };
+ 
+ /** Scroller flags for View2D (#View2D.scroll). */
+@@ -183,6 +185,12 @@ struct View2D {
+    */
+   float page_size_y = 0;
+ 
++  /** 2D view rotation around the center in radians. */
++  float rotation;
++  float rotation_pivot[2];
++
++  char _pad1[4];
++
+   /* animated smooth view */
+   ui::SmoothView2DStore *sms = nullptr;
+   struct wmTimer *smooth_timer = nullptr;
+diff --git a/source/blender/makesrna/intern/rna_screen.cc b/source/blender/makesrna/intern/rna_screen.cc
+index 0b4d7338461..4d7f5214794 100644
+--- a/source/blender/makesrna/intern/rna_screen.cc
++++ b/source/blender/makesrna/intern/rna_screen.cc
+@@ -584,13 +584,17 @@ static void rna_def_view2d_api(StructRNA *srna)
+ static void rna_def_view2d(BlenderRNA *brna)
+ {
+   StructRNA *srna;
+-  // PropertyRNA *prop;
++  PropertyRNA *prop;
+ 
+   srna = RNA_def_struct(brna, "View2D", nullptr);
+   RNA_def_struct_ui_text(srna, "View2D", "Scroll and zoom for a 2D region");
+   RNA_def_struct_sdna(srna, "View2D");
+ 
+   /* TODO: more View2D properties could be exposed here (read-only). */
++  prop = RNA_def_property(srna, "rotation", PROP_FLOAT, PROP_ANGLE);
++  RNA_def_property_float_sdna(prop, nullptr, "rotation");
++  RNA_def_property_ui_text(prop, "Rotation", "Rotation of the 2D view");
++  RNA_def_property_update(prop, NC_SPACE | ND_SPACE_IMAGE, nullptr);
+ 
+   rna_def_view2d_api(srna);
+ }
